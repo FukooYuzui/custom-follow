@@ -39,6 +39,11 @@ async function run(){
   const frame=window.document.querySelector('#playerShell iframe');
   assert.equal(frame.getAttribute('src'),'https://www.youtube.com/embed/AAAAAAAAAAA?autoplay=0&rel=0');
   assert(calls.some(c=>c[0]==='close'),'changing player modes closes the other window');
+  const previousCalls=calls.length;
+  ctx.stopPlayerFromHost();
+  assert.equal(window.document.querySelector('#playerShell iframe'),null,'host close unloads embedded playback');
+  assert.equal(calls.length,previousCalls,'host close cannot call back into Python during native closing');
+  assert.equal(vm.runInContext('playing',ctx),null);
   window.document.getElementById('creatorPlatform').value='youtube';ctx.updateCreatorPlatform();
   window.document.getElementById('uidInput').value='@example';await ctx.addChannel();
   assert(calls.some(c=>c[0]==='add'&&c[1]==='@example'&&c[2]==='youtube'));

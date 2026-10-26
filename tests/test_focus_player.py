@@ -90,7 +90,8 @@ class FocusPlayerTests(unittest.TestCase):
             window = Mock()
             window.events.closed = Event(window)
             with patch.object(focus_player.webview, "create_window", return_value=window) as create, \
-                    patch.object(focus_player.threading, "Thread"):
+                    patch.object(focus_player.threading, "Thread"), \
+                    patch.object(focus_player, 'close_window') as close:
                 manager.open(BV, "测试标题", 1)
                 args = create.call_args.kwargs
                 self.assertIsNone(args["js_api"])
@@ -101,7 +102,8 @@ class FocusPlayerTests(unittest.TestCase):
                 self.assertEqual(create.call_count, 1)
                 window.expose.assert_not_called()
                 manager.close()
-                window.destroy.assert_called_once()
+                close.assert_called_once_with(window)
+                window.destroy.assert_not_called()
 
     def test_closed_window_can_be_created_again(self):
         with TemporaryDirectory() as temp:

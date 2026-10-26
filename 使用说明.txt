@@ -8,8 +8,9 @@
    例如 https://space.bilibili.com/123456，UID 是主页地址里的那串数字。
    昵称可能重名，请核对头像以外的名称、简介和 UID；暂不支持 b23.tv 短链接。
 4. 等待首次检查成功，近期视频会出现在清单中。点击视频打开程序内的“官方网页专注播放”窗口。
-5. 关闭主窗口会收进右下角托盘并继续检查。双击粉色电视图标可打开。
+5. 关闭主窗口会停止播放、关闭播放器，并收进右下角托盘继续检查。双击粉色电视图标可打开。
    托盘图标可能收在任务栏的向上箭头里。完全退出请使用托盘菜单或程序设置。
+   托盘不可用时，关闭主窗口会直接退出。1.1.2 已修复关闭卡死，退出时无需等待网络查询完成。
 
 观看方式
 清单中只有你手动添加的 博主，没有全站推荐列表、热榜和信息流。
@@ -54,7 +55,7 @@ WebView 的播放器站点数据在 CustomFollow/data/webview；不要分享整�
 若另一台电脑缺少运行时，可从 Microsoft 官方页面安装：
 https://developer.microsoft.com/microsoft-edge/webview2/
 保留 CustomFollow 文件夹整体，不能单独移动其中的 exe。
-main.py、focus_player.py、bili_api.py、youtube_api.py、state.py、windows_support.py 和 assets 是可编辑源码。
+main.py、native_ui.py、focus_player.py、bili_api.py、youtube_api.py、state.py、windows_support.py 和 assets 是可编辑源码。
 修改后可用 Python 3.12 运行 main.py；build.ps1 会测试并重新生成成品。
 自动测试是离线协议/状态/Windows集成验证，不代表 B站未来接口始终可用。
 B站接口与策略可能变化；遇到平台验证请在官方渠道处理，程序不会绕过限制。

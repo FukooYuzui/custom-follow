@@ -26,6 +26,7 @@ from windows_support import (Tray, acquire_instance, release_instance, save_sess
                              load_session, set_autostart, get_autostart)
 from focus_player import FocusPlayer
 from youtube_api import YouTubeClient, YouTubeError, youtube_video_id
+from native_ui import post_window, post_js, close_window, show_window, install_bridge_delivery
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'assets'
@@ -33,6 +34,11 @@ LEGACY_DATA = ROOT.parent / 'BiliFocus' / 'data'
 DEFAULT_DATA = LEGACY_DATA if getattr(sys, 'frozen', False) and ROOT.name != 'BiliFocus' and (LEGACY_DATA / 'state.json').is_file() else ROOT / 'data'
 DATA = Path(os.environ.get('BILI_REMINDER_DATA', str(DEFAULT_DATA)))
 BV_RE = re.compile(r'^BV[0-9A-Za-z]{10}$')
+
+
+class AppClosing(BiliError):
+    def __init__(self):
+        super().__init__('程序正在关闭，本次操作已取消。', False)
 
 
 def video_bvid(video):
@@ -76,11 +82,45 @@ class Application:
         self.notification_lock = threading.RLock()
         self.search_lock = threading.Lock()
         self.last_search = 0
-        self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player)
-        self.youtube_player = FocusPlayer(ASSETS, lambda: {}, self.return_from_player, platform='youtube')
+        self.lifecycle_lock = threading.Lock()
+        self.playback_allowed = '--background' not in sys.argv
+        can_open = lambda: self.playback_allowed and not self.quitting
+        self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player, can_open=can_open)
+        self.youtube_player = FocusPlayer(ASSETS, lambda: {}, self.return_from_player, platform='youtube', can_open=can_open)
 
     def playback_cookies(self):
         return load_session(DATA / 'session.bin')
+
+    def request(self, function, *args, **kwargs):
+        """Let an RPC caller stop waiting when the application is closing.
+
+        The bounded network operation runs on a daemon; it never commits state.
+        Commit steps stay in the RPC caller after this method returns, so a late
+        response cannot modify data after cancellation or keep Python alive.
+        """
+        if self.stopping.is_set():
+            raise AppClosing()
+        done = threading.Event()
+        result = []
+        def run():
+            try:
+                if self.stopping.is_set():
+                    raise AppClosing()
+                result.append((True, function(*args, **kwargs)))
+            except Exception as exc:
+                result.append((False, exc))
+            finally:
+                done.set()
+        threading.Thread(target=run, name='cancellable-request', daemon=True).start()
+        while not done.wait(0.05):
+            if self.stopping.is_set():
+                raise AppClosing()
+        if self.stopping.is_set():
+            raise AppClosing()
+        ok, value = result[0]
+        if not ok:
+            raise value
+        return value
 
     def return_from_player(self):
         self.show()
@@ -95,43 +135,59 @@ class Application:
 
     def emit(self, method, value):
         if self.ready.is_set() and not self.quitting:
-            try:
-                self.window.evaluate_js(f'window.{method}({json.dumps(value, ensure_ascii=True)})')
-            except Exception:
-                logging.warning('UI refresh unavailable')
+            post_js(self.window, f'window.{method}({json.dumps(value, ensure_ascii=True)})')
 
     def changed(self):
         self.emit('receiveState', self.snapshot())
 
     def show(self):
-        if self.window:
-            self.window.show()
-            self.window.restore()
+        with self.lifecycle_lock:
+            if self.quitting:
+                return
+            self.playback_allowed = True
+        show_window(self.window)
+
+    def hide_to_tray(self):
+        with self.lifecycle_lock:
+            if self.quitting or not self.tray_ok:
+                return False
+            self.playback_allowed = False
+        # This callback may run on the GUI thread: enqueue work and return.
+        # Do not evaluate_js, Invoke, join, or wait for a renderer here.
+        def hide(form):
+            core = form.browser.webview.CoreWebView2
+            if core is not None:
+                core.ExecuteScriptAsync('if(window.stopPlayerFromHost)window.stopPlayerFromHost();')
+            form.Hide()
+        post_window(self.window, hide)
+        self.focus_player.close()
+        self.youtube_player.close()
+        return True
 
     def close(self):
         if self.quitting:
             return True
         if self.tray_ok:
-            self.emit('stopPlayer', None)
-            self.focus_player.close()
-            self.youtube_player.close()
-            self.window.hide()
+            self.hide_to_tray()
             return False
         self.quit()
-        return True
+        # The queued Close will reenter with quitting=True after this returns.
+        return False
 
     def quit(self):
-        self.quitting = True
-        self.stopping.set()
-        self.wake.set()
+        with self.lifecycle_lock:
+            if self.quitting:
+                return
+            self.quitting = True
+            self.playback_allowed = False
+            self.stopping.set()
+            self.wake.set()
         self.focus_player.close()
         self.youtube_player.close()
         if self.tray:
-            self.tray.stop()
-        if self.toast:
-            self.toast.destroy()
-        if self.window:
-            self.window.destroy()
+            threading.Thread(target=self.tray.stop, name='tray-stop', daemon=True).start()
+        close_window(self.toast)
+        close_window(self.window)
 
     def request_check(self):
         if self.store.snapshot()['settings']['paused']:
@@ -222,8 +278,14 @@ class Application:
     def notify(self, videos=None, test=False):
         if self.stopping.is_set():
             return
-        if not self.toast_ready.wait(8):
-            self.warning = '弹窗尚未就绪；更新仍保存在视频列表中。'
+        deadline = time.monotonic() + 8
+        while not self.toast_ready.wait(0.05):
+            if self.stopping.is_set():
+                return
+            if time.monotonic() >= deadline:
+                self.warning = '弹窗尚未就绪；更新仍保存在视频列表中。'
+                return
+        if self.stopping.is_set():
             return
         if test:
             title, body, key = '新视频通知预览', '你关注的博主有新视频时，可从这里打开定制关注。', None
@@ -235,8 +297,15 @@ class Application:
             self.toast_version += 1
             version = self.toast_version
             self.toast_target = key
-            self.toast.run_js(f'window.setNotification({json.dumps(dict(title=title, body=body), ensure_ascii=True)})')
-            self.toast.show()
+            script = f'window.setNotification({json.dumps(dict(title=title, body=body), ensure_ascii=True)})'
+            def display(form):
+                if self.quitting or version != self.toast_version:
+                    return
+                core = form.browser.webview.CoreWebView2
+                if core is not None:
+                    core.ExecuteScriptAsync(script)
+                form.Show()
+            post_window(self.toast, display)
         if self.store.snapshot()['settings']['sound']:
             import winsound
             winsound.MessageBeep(winsound.MB_OK)
@@ -244,7 +313,7 @@ class Application:
             if not self.stopping.wait(14):
                 with self.notification_lock:
                     if version == self.toast_version:
-                        self.toast.hide()
+                        post_window(self.toast, lambda form: form.Hide())
         threading.Thread(target=hide_later, daemon=True).start()
 
     def boot(self):
@@ -274,7 +343,7 @@ class Api:
     def add_channel(self, text, platform='bilibili'):
         try:
             if platform == 'youtube':
-                info, feed = self._app.youtube.resolve_channel(text)
+                info, feed = self._app.request(self._app.youtube.resolve_channel, text)
                 result = self._app.store.add_channel(info['channel_id'], info['name'], 'youtube')
                 uid = result['uid']
                 self._app.store.ingest(uid, feed)
@@ -286,7 +355,7 @@ class Api:
             self._app.wake.set()
             self._app.changed()
             return {'ok': True, 'uid': uid, 'result': result}
-        except (ValueError, OSError, YouTubeError) as exc:
+        except (ValueError, OSError, YouTubeError, AppClosing) as exc:
             return {'ok': False, 'error': str(exc)}
 
     def search_channels(self, keyword):
@@ -299,7 +368,7 @@ class Api:
                 return {'ok': False, 'error': '请稍等 5 秒再查找。'}
             self._app.last_search = now
             try:
-                return {'ok': True, 'users': self._app.client.search_users(text)}
+                return {'ok': True, 'users': self._app.request(self._app.client.search_users, text)}
             except BiliError as exc:
                 return {'ok': False, 'error': str(exc)}
 
@@ -358,6 +427,8 @@ class Api:
             webbrowser.open('https://www.youtube.com/watch?v=' + youtube_video_id(video))
 
     def open_focus_video(self, key, part=1):
+        if self._app.quitting or not self._app.playback_allowed:
+            return {'ok': False, 'error': '播放已停止；请打开主窗口后再选择视频。'}
         video = next((v for v in self._app.store.snapshot()['videos'] if v['key'] == key), None)
         if not video or not (video_bvid(video) or youtube_video_id(video)):
             return {'ok': False, 'error': '该视频已不在你的关注列表，或视频编号无效。'}
@@ -366,13 +437,15 @@ class Api:
         try:
             if youtube_video_id(video):
                 self._app.focus_player.close()
-                self._app.youtube_player.open(youtube_video_id(video), video['title'])
+                self._app.request(self._app.youtube_player.open, youtube_video_id(video), video['title'])
             else:
                 self._app.youtube_player.close()
-                self._app.focus_player.open(video_bvid(video), video['title'], int(part))
+                self._app.request(self._app.focus_player.open, video_bvid(video), video['title'], int(part))
             self._app.store.mark_read(key)
             self._app.changed()
             return {'ok': True, 'video': video, 'bvid': video_bvid(video), 'video_id': youtube_video_id(video), 'platform': video.get('platform', 'bilibili')}
+        except AppClosing as exc:
+            return {'ok': False, 'error': str(exc)}
         except Exception:
             logging.exception('Official player could not open')
             return {'ok': False, 'error': '官方播放窗口未能打开，请稍后重试，或切换到嵌入备用模式。'}
@@ -394,7 +467,7 @@ class Api:
         with self._app.login_lock:
             try:
                 client = BiliClient()
-                result = client.create_qr()
+                result = self._app.request(client.create_qr)
                 self._app.qr_client, self._app.qr_key = client, result['qrcode_key']
                 buffer = io.BytesIO()
                 qrcode.make(result['url']).save(buffer, format='PNG')
@@ -407,13 +480,15 @@ class Api:
             if not self._app.qr_key or not self._app.qr_client:
                 return {'status': 'expired'}
             try:
-                result = self._app.qr_client.poll_qr(self._app.qr_key)
+                result = self._app.request(self._app.qr_client.poll_qr, self._app.qr_key)
                 if result['status'] == 'success':
                     cookies = result['cookies']
                     save_session(DATA / 'session.bin', cookies)
                     client = BiliClient(cookies=cookies)
                     try:
-                        name = client.check_login() or 'B 站用户'
+                        name = self._app.request(client.check_login) or 'B 站用户'
+                    except AppClosing:
+                        raise
                     except BiliError:
                         name = 'B 站用户'
                     self._app.client = client
@@ -444,15 +519,13 @@ class Api:
 
     def hide_window(self):
         if self._app.tray_ok:
-            self._app.emit('stopPlayer', None)
-            self._app.focus_player.close()
-            self._app.youtube_player.close()
-            self._app.window.hide()
+            self._app.hide_to_tray()
             return {'ok': True}
         return {'ok': False, 'error': '托盘不可用，请保留窗口运行。'}
 
     def quit(self):
-        threading.Thread(target=self._app.quit, daemon=True).start()
+        self._app.quit()
+        return {'ok': True}
 
 
 class NotificationApi:
@@ -462,13 +535,13 @@ class NotificationApi:
     def open(self):
         with self._app.notification_lock:
             key = self._app.toast_target
-            self._app.toast.hide()
+            post_window(self._app.toast, lambda form: form.Hide())
         self._app.show()
         if key:
             self._app.emit('openVideo', key)
 
     def dismiss(self):
-        self._app.toast.hide()
+        post_window(self._app.toast, lambda form: form.Hide())
 
 
 def run():
@@ -485,6 +558,7 @@ def run():
                                           hidden='--background' in sys.argv, background_color='#101217')
         app.window.events.loaded += app.ready.set
         app.window.events.closing += app.close
+        install_bridge_delivery(app.window)
         class Rect(ctypes.Structure):
             _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long), ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
         rect = Rect()
@@ -495,6 +569,7 @@ def run():
                                          frameless=True, resizable=False, on_top=True, hidden=True, focus=False,
                                          background_color='#191c24')
         app.toast.events.loaded += app.toast_ready.set
+        install_bridge_delivery(app.toast)
         webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = True
         webview.start(app.boot, gui='edgechromium', debug=False, private_mode=False,
                       storage_path=str(DATA / 'webview'), icon=str(ASSETS / 'app.ico'))

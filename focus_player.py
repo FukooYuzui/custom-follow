@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
+from native_ui import close_window, show_window
 
 
 BVID = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -107,14 +108,17 @@ def _delete_login_cookies(core) -> None:
 
 
 class FocusPlayer:
-    def __init__(self, assets_path: Path, cookie_provider, on_return, platform='bilibili'):
+    def __init__(self, assets_path: Path, cookie_provider, on_return, platform='bilibili', can_open=None):
         if platform not in {'bilibili', 'youtube'}:
             raise ValueError('不支持的播放平台。')
         self.platform = platform
         self.assets_path = Path(assets_path)
         self.cookie_provider = cookie_provider
         self.on_return = on_return
+        self.can_open = can_open or (lambda: True)
         self._lock = threading.RLock()
+        self._open_lock = threading.Lock()
+        self._generation = 0
         self._window = None
         self._target = None
         self._native_ready = False
@@ -145,13 +149,18 @@ class FocusPlayer:
             raise ValueError("专注播放资源缺失，请重新安装程序。")
         display_title = str(title or "B站视频").replace("\r", " ").replace("\n", " ")[:100]
         with self._lock:
-            self._target = (bvid, url, display_title)
-            window = self._window
+            requested_generation = self._generation
+        # Serialize open requests without holding the state lock over a native
+        # GUI call. Navigation/close callbacks on that GUI thread need the same
+        # state lock, and waiting on it during create_window can deadlock.
+        with self._open_lock:
+            with self._lock:
+                if requested_generation != self._generation or not self.can_open():
+                    return
+                generation = self._generation
+                self._target = (bvid, url, display_title)
+                window = self._window
             if window is None:
-                self.ready.clear()
-                self.last_error = ""
-                self.last_warning = ""
-                self._native_ready = False
                 window = webview.create_window(
                     "官方网页专注播放 · " + display_title,
                     html=WAITING_HTML, js_api=None,
@@ -160,15 +169,25 @@ class FocusPlayer:
                 )
                 if window is None:
                     raise RuntimeError("无法创建播放窗口。")
-                self._window = window
+                with self._lock:
+                    cancelled = generation != self._generation or not self.can_open()
+                    if not cancelled:
+                        self.ready.clear()
+                        self.last_error = ""
+                        self.last_warning = ""
+                        self._native_ready = False
+                        self._window = window
+                if cancelled:
+                    close_window(window)
+                    return
                 window.events.closed += lambda: self._on_closed(window)
                 threading.Thread(target=self._initialize, args=(window, script), daemon=True,
                                  name="bili-focus-setup").start()
-            navigate_now = self._native_ready
-        if navigate_now:
-            self._navigate(window, url, display_title)
-        window.show()
-        window.restore()
+            with self._lock:
+                navigate_now = self._window is window and self._native_ready
+            if navigate_now:
+                self._navigate(window, url, display_title)
+            show_window(window)
 
     @staticmethod
     def _ui(window, callback):
@@ -228,6 +247,9 @@ class FocusPlayer:
         core.Settings.AreDevToolsEnabled = False
 
         def navigation_start(sender, args):
+            if not self._is_current(window):
+                args.Cancel = True
+                return
             with self._lock:
                 bvid = self._target[0] if self._target else ""
                 local_setup = not self._native_ready
@@ -239,6 +261,8 @@ class FocusPlayer:
 
         def popup(sender, args):
             args.Handled = True
+            if not self._is_current(window):
+                return
             with self._lock:
                 bvid = self._target[0] if self._target else ""
             url = str(args.Uri)
@@ -261,6 +285,8 @@ class FocusPlayer:
             window.events.loaded.set()
 
         def source_changed(sender, args):
+            if not self._is_current(window):
+                return
             # SPA history updates do not necessarily emit NavigationStarting.
             # Do not let a site-side "next video" silently leave this selection.
             with self._lock:
@@ -371,6 +397,7 @@ class FocusPlayer:
     def _on_closed(self, window):
         with self._lock:
             if self._window is window:
+                self._generation += 1
                 self._window = None
                 self._native_ready = False
                 self.ready.clear()
@@ -378,9 +405,10 @@ class FocusPlayer:
 
     def close(self) -> None:
         with self._lock:
+            self._generation += 1
             window = self._window
             self._window = None
             self._native_ready = False
             self.ready.clear()
         if window:
-            window.destroy()
+            close_window(window)

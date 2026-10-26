@@ -161,9 +161,12 @@ class AppTests(unittest.TestCase):
         self.app.tray_ok = True
         self.app.window = Mock()
         self.app.emit = Mock()
-        self.assertFalse(self.app.close())
-        self.app.emit.assert_called_once_with("stopPlayer", None)
-        self.app.window.hide.assert_called_once()
+        with patch.object(main, 'post_window') as post:
+            self.assertFalse(self.app.close())
+        post.assert_called_once()
+        self.app.emit.assert_not_called()
+        self.app.window.evaluate_js.assert_not_called()
+        self.assertFalse(self.app.playback_allowed)
         self.assertFalse(self.app.stopping.is_set())
 
 

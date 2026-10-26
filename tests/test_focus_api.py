@@ -8,6 +8,9 @@ from main import Api
 class OfficialPlayerApiTests(unittest.TestCase):
     def setUp(self):
         self.app = Mock()
+        self.app.quitting = False
+        self.app.playback_allowed = True
+        self.app.request.side_effect = lambda function, *args, **kwargs: function(*args, **kwargs)
         self.video = dict(key='BV1cpJ86BEys', title='Fixture', uid='254463269')
         self.app.store.snapshot.return_value = {'videos': [self.video]}
         self.api = Api(self.app)
