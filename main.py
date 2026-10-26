@@ -174,7 +174,7 @@ class Application:
                             continue
                         news = self.store.ingest(channel['uid'], feed)
                         if getattr(feed, 'has_more', False) and channel.get('initialized'):
-                            self.warning = '离线期间更新较多，本次仅检查了有限页数；更早投稿可在 UP 主空间查看。'
+                            self.warning = '离线期间更新较多，本次仅检查了有限页数；更早投稿可在 博主主页查看。'
                         if news:
                             settings = self.store.snapshot()['settings']
                             if settings['popups'] and not is_quiet(settings):
@@ -226,7 +226,7 @@ class Application:
             self.warning = '弹窗尚未就绪；更新仍保存在视频列表中。'
             return
         if test:
-            title, body, key = '桌面提醒已准备好', '关注的 UP 主发布新视频后，会在这里提醒你。', None
+            title, body, key = '新视频通知预览', '你关注的博主有新视频时，可从这里打开定制关注。', None
         else:
             first = videos[0]
             title = f"{first['author']} 更新了" + (f" {len(videos)} 个视频" if len(videos) > 1 else '新视频')
@@ -252,7 +252,7 @@ class Application:
             try:
                 set_autostart(True)
             except OSError:
-                self.warning = '开机启动路径未能更新，请在提醒设置中重新保存。'
+                self.warning = '开机启动路径未能更新，请在设置中重新保存。'
         self.tray = Tray(self.show, self.request_check, self.quit)
         self.tray_ok = self.tray.start()
         if not self.tray_ok:
@@ -292,7 +292,7 @@ class Api:
     def search_channels(self, keyword):
         text = str(keyword).strip()
         if not text or len(text) > 40 or '://' in text or 'bilibili.com' in text or 'b23.tv' in text:
-            return {'ok': False, 'error': '请输入 1～40 个字的 UP 主昵称；主页链接请直接添加。'}
+            return {'ok': False, 'error': '请输入 1～40 个字的 B站博主昵称；主页链接请直接添加。'}
         with self._app.search_lock:
             now = time.monotonic()
             if now - self._app.last_search < 5:
@@ -332,7 +332,7 @@ class Api:
             return {'ok': False, 'error': '检查已暂停，请先在设置中恢复检查。'}
         accepted = self._app.request_check()
         self._app.changed()
-        return {'ok': accepted, 'error': '' if accepted else '请至少间隔 60 秒再检查；失败退避中的 UP 主会按计划重试。'}
+        return {'ok': accepted, 'error': '' if accepted else '请至少间隔 60 秒再检查；暂时查询失败的博主会按计划重试。'}
 
     def play_video(self, key):
         video = next((v for v in self._app.store.snapshot()['videos'] if v['key'] == key), None)

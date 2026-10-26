@@ -1,8 +1,8 @@
 {
   "name": "custom-follow",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
-  "description": "定制关注 · B站与YouTube视频更新提醒及专注播放",
+  "description": "定制关注 · 把想看的 B站与 YouTube 博主放在一起",
   "scripts": {
     "test": "node tests/test_focus_script.js && node tests/test_youtube_focus.js && node tests/test_ui.js"
   },
