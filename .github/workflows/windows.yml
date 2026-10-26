@@ -1,0 +1,35 @@
+name: Windows checks and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Build and test
+        shell: powershell
+        run: .\build.ps1
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomFollow-Windows-x64
+          path: |
+            CustomFollow/
+            启动.cmd
+            使用说明.txt
+          if-no-files-found: error

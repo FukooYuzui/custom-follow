@@ -1,0 +1,6 @@
+requests==2.34.2
+pillow==13.0.0
+pystray==0.19.5
+qrcode==8.2
+pywebview==6.2.1
+pythonnet==3.2.1

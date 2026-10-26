@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'">
+  <title>B站更新提醒</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { background: #191c24; color: #f3f4f8; user-select: none; }
+    .notification { width: 100%; height: 100%; min-width: 0; padding: 15px 17px; display: grid; grid-template-rows: 22px minmax(0, 1fr) 32px; gap: 10px; border: 1px solid #343743; border-top: 2px solid #fb7299; }
+    .header { display: flex; align-items: center; justify-content: space-between; min-width: 0; }
+    .brand { display: flex; align-items: center; gap: 7px; color: #afb4c6; font-size: 11px; letter-spacing: .6px; }
+    .brand svg { width: 19px; height: 19px; color: #fb7299; flex: none; }
+    button { font-family: inherit; border: 0; cursor: pointer; }
+    button:focus-visible { outline: 2px solid #a5c9ff; outline-offset: 3px; }
+    button:disabled { opacity: .65; cursor: default; }
+    .close { width: 24px; height: 24px; display: grid; place-items: center; padding: 4px; border-radius: 6px; color: #9299ae; background: transparent; }
+    .close:hover { color: #ffffff; background: #2b303e; }
+    .close svg { width: 14px; height: 14px; }
+    .content { min-width: 0; align-self: center; }
+    h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 0 5px; color: #f4f5f9; font-size: 15px; line-height: 22px; font-weight: 650; }
+    p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; margin: 0; color: #aab0c1; font-size: 12px; line-height: 18px; max-height: 36px; }
+    .footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+    .hint { color: #727c95; font-size: 10px; white-space: nowrap; }
+    .open { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 32px; padding: 0 13px; border-radius: 7px; color: #24111b; background: #fb7299; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .open:hover { background: #ff8aaa; }
+    .open:active { background: #ea638a; }
+    .open svg { width: 13px; height: 13px; }
+    @media (max-width: 320px) { .hint { display: none; } .footer { justify-content: flex-end; } }
+  </style>
+</head>
+<body>
+  <section class="notification" aria-label="B站更新提醒">
+    <header class="header">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 3 3 4m7-4-3 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><rect x="3" y="7" width="18" height="14" rx="4" stroke="currentColor" stroke-width="1.8"/><path d="M8 12v3m8-3v3m-6 3h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>B站 UP 主提醒</span>
+      </div>
+      <button id="dismiss" class="close" type="button" aria-label="关闭提醒" title="关闭提醒" disabled>
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div class="content" aria-live="polite" aria-atomic="true">
+      <h1 id="title">有新视频，等你来看</h1>
+      <p id="body">关注的 UP 主有新投稿时，会在这里提醒你。</p>
+    </div>
+    <footer class="footer">
+      <span class="hint">只关注你选择的 UP 主</span>
+      <button id="open" class="open" type="button" disabled>
+        <span>在程序内查看</span>
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </footer>
+  </section>
+  <script>
+    'use strict';
+    const titleElement = document.getElementById('title');
+    const bodyElement = document.getElementById('body');
+    const openButton = document.getElementById('open');
+    const dismissButton = document.getElementById('dismiss');
+    window.setNotification = function (data) {
+      const value = data && typeof data === 'object' ? data : {};
+      titleElement.textContent = String(value.title ?? '有新视频，等你来看');
+      titleElement.title = titleElement.textContent;
+      bodyElement.textContent = String(value.body ?? '');
+      bodyElement.title = bodyElement.textContent;
+    };
+    function ready() {
+      if (window.pywebview && window.pywebview.api) {
+        openButton.disabled = false;
+        dismissButton.disabled = false;
+      }
+    }
+    async function invoke(method) {
+      if (!window.pywebview || !window.pywebview.api) return;
+      try { await window.pywebview.api[method](); }
+      catch (_) { /* The window may already have been dismissed or destroyed. */ }
+    }
+    openButton.addEventListener('click', function () { invoke('open'); });
+    dismissButton.addEventListener('click', function () { invoke('dismiss'); });
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') { event.preventDefault(); invoke('dismiss'); }
+    });
+    window.addEventListener('pywebviewready', ready);
+    ready();
+  </script>
+</body>
+</html>
