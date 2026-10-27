@@ -1,2 +1,2 @@
 @echo off
-start "" "%~dp0BiliFocus\BiliFocus.exe"
+start "" "%~dp0CustomFollow\CustomFollow.exe"
