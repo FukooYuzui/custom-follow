@@ -3,11 +3,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock
+from datetime import datetime
 
 import requests
 
 from youtube_api import (YouTubeClient, YouTubeError, YouTubeFeed, YouTubeVideo, channel_input,
-                         channel_key, parse_atom, parse_video_page, relative_timestamp)
+                         channel_key, parse_atom, parse_video_page, relative_timestamp, parse_video_publication)
 from state import Store
 from focus_player import allowed_youtube_navigation, youtube_url
 
@@ -41,6 +42,12 @@ def atom(channel_id=CID):
       <yt:channelId>{channel_id}</yt:channelId><title>Fixture channel</title><author><name>Fixture channel</name></author>
       <entry><yt:videoId>{VID}</yt:videoId><yt:channelId>{channel_id}</yt:channelId><title>Video</title><published>2026-10-25T10:00:00Z</published></entry>
     </feed>'''
+
+
+def watch_date(date='2026-10-16T09:15:20-07:00', video=VID, channel=CID, **extra):
+    data = {'videoDetails': {'videoId': video, **extra}, 'microformat': {
+        'playerMicroformatRenderer': {'externalChannelId': channel, 'publishDate': date}}}
+    return '<script>var ytInitialPlayerResponse = ' + json.dumps(data) + ';</script>'
 
 
 class YouTubeProtocolTests(unittest.TestCase):
@@ -85,13 +92,65 @@ class YouTubeProtocolTests(unittest.TestCase):
         self.assertIsNone(relative_timestamp('Scheduled for tomorrow', 100000))
 
     def test_rss_404_falls_back_without_retrying_rss_each_poll(self):
-        client = YouTubeClient()
+        client = YouTubeClient(metadata_budget=0)
         client._get = Mock(side_effect=[None, page(), page()])
         self.assertEqual('channel_page', client.fetch_videos(CID).source)
         client.fetch_videos(CID)
         urls = [call.args[0] for call in client._get.call_args_list]
         self.assertEqual(1, sum('/feeds/videos.xml' in u for u in urls))
         self.assertEqual(2, sum('/videos?hl=en' in u for u in urls))
+
+    def test_current_compact_dates_and_accessibility_labels_are_read(self):
+        for label, seconds in [('10d ago',864000),('3h ago',10800),('2mo ago',5184000),('1 yr ago',31536000),('5 min ago',300)]:
+            self.assertEqual(40000000-seconds, relative_timestamp(label,40000000),label)
+        data = json.loads(page().split(' = ')[1].split(';</script>')[0])
+        part = data['contents']['twoColumnBrowseResultsRenderer']['tabs'][0]['tabRenderer']['content']['richGridRenderer']['contents'][0]['richItemRenderer']['content']['lockupViewModel']['metadata']['lockupMetadataViewModel']['metadata']['contentMetadataViewModel']['metadataRows'][0]['metadataParts'][1]
+        part.update(text={'content':'10d ago'},accessibilityLabel='10 days ago')
+        _, feed = parse_video_page('<script>var ytInitialData = '+json.dumps(data)+';</script>',CID,now=1000000)
+        self.assertEqual(136000,feed.videos[0].published_at)
+        self.assertEqual('10 days ago',feed.videos[0].published_label)
+
+    def test_missing_publication_is_unknown_instead_of_poll_time(self):
+        _, feed = parse_video_page(page([(VID,'Video','')]),CID,now=100000)
+        self.assertEqual(0,feed.videos[0].published_at)
+        self.assertEqual('unknown',feed.videos[0].published_precision)
+
+    def test_exact_publication_uses_timezone_and_checks_video_owner(self):
+        result = parse_video_publication(watch_date(),VID,CID)
+        self.assertEqual(datetime.fromisoformat('2026-10-16T09:15:20-07:00').timestamp(),result['published_at'])
+        self.assertFalse(result['timestamp_approximate'])
+        for text in (watch_date(video=OTHER),watch_date(channel='UC'+'b'*22),watch_date(isUpcoming=True),watch_date(date='2026-10-16T09:15:20')):
+            with self.assertRaises(YouTubeError):parse_video_publication(text,VID,CID)
+        day=parse_video_publication(watch_date(date='2026-10-16'),VID,CID)
+        self.assertEqual('day',day['published_precision'])
+        self.assertEqual('2026-10-16',day['published_label'])
+
+    def test_publication_enrichment_is_bounded_cached_and_survives_restart(self):
+        client=YouTubeClient(metadata_budget=1)
+        _, feed=parse_video_page(page([(VID,'First','10d ago'),(OTHER,'Second','11d ago')]),CID)
+        client._get=Mock(return_value=watch_date())
+        first=client._enrich_dates(feed,CID)
+        self.assertFalse(first.videos[0].timestamp_approximate)
+        self.assertTrue(first.videos[1].timestamp_approximate)
+        self.assertEqual(1,client._get.call_count)
+        seeded=YouTubeClient(known_videos=[vars(first.videos[0])],metadata_budget=0)
+        seeded._get=Mock(side_effect=AssertionError('known publication must not refetch'))
+        self.assertFalse(seeded._enrich_dates(feed,CID).videos[0].timestamp_approximate)
+
+    def test_optional_metadata_failure_keeps_the_public_video_list(self):
+        client=YouTubeClient(metadata_budget=1)
+        _, feed=parse_video_page(page(),CID)
+        client._get=Mock(side_effect=YouTubeError('Unavailable'))
+        self.assertEqual(feed,client._enrich_dates(feed,CID))
+        client._enrich_dates(feed,CID)
+        self.assertEqual(1,client._get.call_count,'failed metadata uses retry cooldown')
+
+    def test_upcoming_compact_badge_is_not_a_published_video(self):
+        data=json.loads(page().split(' = ')[1].split(';</script>')[0])
+        contents=data['contents']['twoColumnBrowseResultsRenderer']['tabs'][0]['tabRenderer']['content']['richGridRenderer']['contents']
+        contents[0]['richItemRenderer']['content']['lockupViewModel']['contentImage']['thumbnailViewModel']['overlays'][0]['thumbnailBottomOverlayViewModel']['badges'][0]['thumbnailBadgeViewModel']['badgeStyle']='THUMBNAIL_OVERLAY_BADGE_STYLE_UPCOMING'
+        _,feed=parse_video_page('<script>var ytInitialData = '+json.dumps(data)+';</script>',CID)
+        self.assertEqual([],feed.videos)
 
     def test_connectivity_errors_never_expose_transport_exception(self):
         client = YouTubeClient()
@@ -140,6 +199,26 @@ class YouTubeStoreTests(unittest.TestCase):
         self.store.add_channel('42')
         self.store.remove_channel(channel_key(CID))
         self.assertEqual(['42'],[c['uid'] for c in self.store.snapshot()['channels']])
+
+    def test_metadata_correction_never_creates_repeat_notifications_or_loses_read_flags(self):
+        self.store.ingest(channel_key(CID),YouTubeFeed('Fixture',[self.video(VID,90)],order_is_freshness=True),now=100)
+        exact=YouTubeVideo('yt:'+VID,'Video','https://www.youtube.com/watch?v='+VID,85,'Fixture',published_precision='second')
+        news=self.store.ingest(channel_key(CID),YouTubeFeed('Fixture',[exact]),now=110)
+        self.assertEqual([],news)
+        self.assertTrue(self.store.snapshot()['videos'][0]['read'])
+        self.store.ingest(channel_key(CID),YouTubeFeed('Fixture',[self.video(VID,95)],order_is_freshness=True),now=120)
+        video=self.store.snapshot()['videos'][0]
+        self.assertEqual(85,video['published_at'],'exact publication cannot be downgraded to a relative estimate')
+        self.assertFalse(video['timestamp_approximate'])
+
+    def test_loading_legacy_unknown_dates_discards_fabricated_poll_times(self):
+        self.store.ingest(channel_key(CID),YouTubeFeed('Fixture',[self.video(VID,90)],order_is_freshness=True),now=100)
+        path=self.store.path
+        loaded=Store(path).snapshot()
+        self.assertEqual(0,loaded['videos'][0]['published_at'])
+        self.assertEqual('unknown',loaded['videos'][0]['published_precision'])
+        self.assertEqual(['yt:'+VID],loaded['channels'][0]['seen'])
+        self.assertTrue(loaded['videos'][0]['read'])
 
 
 if __name__ == '__main__':

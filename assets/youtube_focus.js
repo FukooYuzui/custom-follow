@@ -18,6 +18,7 @@
   const OWN = 'data-cf-owned', HIDDEN = 'data-cf-hidden', PATH = 'data-cf-path';
   let mode = 'pending', player = null, timer = 0, ready = false, scans = 0;
   let hostFullscreen = false;
+  let resizeObserver = null, lastSize = '', resizeTimer = 0;
   const started = Date.now(), hidden = new Set(), ancestors = new Set(), toggled = new WeakSet();
   const style = document.createElement('style');
   style.setAttribute(OWN, '');
@@ -31,7 +32,12 @@
     html[data-cf-yt="focus"] [data-cf-player]:fullscreen{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important}
     html[data-cf-yt="focus"] [data-cf-player] .html5-video-container{width:100%!important;height:100%!important}
     html[data-cf-yt="focus"] [data-cf-player] video{width:100%!important;height:100%!important;left:0!important;top:0!important;object-fit:contain!important}
-    html[data-cf-yt="focus"] [data-cf-player] .ytp-chrome-bottom{left:12px!important;right:12px!important;width:calc(100% - 24px)!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-chrome-bottom{left:12px!important;right:12px!important;width:auto!important;bottom:12px!important;box-sizing:border-box!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-chrome-controls{max-width:100%!important;min-width:0!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-right-controls{flex-shrink:0!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu{right:12px!important;left:auto!important;bottom:84px!important;max-width:calc(100% - 24px)!important;max-height:calc(100% - 96px)!important;overflow-y:auto!important;overscroll-behavior:contain!important;box-sizing:border-box!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu .ytp-panel-menu{max-height:calc(100vh - 204px)!important;overflow-y:auto!important;overscroll-behavior:contain!important}
+    html[data-cf-yt="focus"][data-cf-yt-fullscreen] [data-cf-player] .ytp-settings-menu .ytp-panel-menu{max-height:calc(100vh - 150px)!important}
     html[data-cf-yt="focus"] .ytp-endscreen-content,html[data-cf-yt="focus"] .ytp-ce-element,html[data-cf-yt="focus"] .ytp-pause-overlay{display:none!important}
     #cf-yt-toolbar,#cf-yt-wait,#cf-yt-notice{box-sizing:border-box!important;font:13px/1.5 "Microsoft YaHei UI",sans-serif!important;color:#e8edf7!important}
     #cf-yt-toolbar{position:fixed!important;inset:0 0 auto!important;height:54px!important;z-index:2147483000!important;display:flex!important;align-items:center!important;gap:14px!important;padding:0 18px!important;background:#171c28!important;border-bottom:1px solid #30394c!important}
@@ -81,6 +87,17 @@
     const autoplay=player.querySelector('.ytp-autonav-toggle-button[aria-checked="true"]');
     if(autoplay&&!toggled.has(autoplay)){toggled.add(autoplay);autoplay.click();}
   }
+  function syncPlayerSize(){
+    resizeTimer=0;if(mode!=='focus'||!player?.isConnected)return;
+    const width=Math.round(player.clientWidth||0),height=Math.round(player.clientHeight||0),size=width+'x'+height;
+    if(!width||!height||size===lastSize)return;
+    lastSize=size;
+    // Let the official control layout use the focus viewport, rather than its
+    // former narrow watch-page column. Media, quality and account state stay intact.
+    if(typeof player.setSize==='function'){try{player.setSize(width,height);}catch(_){}}
+    window.dispatchEvent(new Event('resize'));
+  }
+  function scheduleSize(){if(!resizeTimer)resizeTimer=setTimeout(syncPlayerSize,40);}
   function waiting() {
     let box=document.getElementById('cf-yt-wait');
     if(!box){box=element('div');box.id='cf-yt-wait';box.setAttribute(OWN,'');document.body.append(box);}
@@ -91,15 +108,15 @@
   function scan() {
     timer=0;if(!document.body)return;scans++;attach();toolbar();
     const next=document.querySelector('#movie_player.html5-video-player,#movie_player,#player .html5-video-player');
-    if(next&&next!==player){if(player)player.removeAttribute('data-cf-player');player=next;}
+    if(next&&next!==player){if(player)player.removeAttribute('data-cf-player');player=next;lastSize='';resizeObserver?.disconnect();if(typeof window.ResizeObserver==='function'){resizeObserver=new ResizeObserver(scheduleSize);resizeObserver.observe(player);}}
     ready=Boolean(player&&player.isConnected);
     if(mode==='full')return;
-    if(ready){mode='focus';attach();document.getElementById('cf-yt-wait')?.remove();isolate();}
+    if(ready){mode='focus';attach();document.getElementById('cf-yt-wait')?.remove();isolate();scheduleSize();}
     else{mode=Date.now()-started>20000?'failed':'pending';attach();waiting();}
   }
   function schedule(){if(!timer)timer=setTimeout(scan,180);}
-  function setMode(next){mode=next==='full'?'full':'pending';attach();if(mode==='full')document.getElementById('cf-yt-wait')?.remove();scan();window.dispatchEvent(new Event('resize'));}
-  function syncFullscreen(){document.documentElement.toggleAttribute('data-cf-yt-fullscreen',hostFullscreen||Boolean(document.fullscreenElement));}
+  function setMode(next){mode=next==='full'?'full':'pending';lastSize='';attach();if(mode==='full')document.getElementById('cf-yt-wait')?.remove();scan();window.dispatchEvent(new Event('resize'));}
+  function syncFullscreen(){document.documentElement.toggleAttribute('data-cf-yt-fullscreen',hostFullscreen||Boolean(document.fullscreenElement));scheduleSize();}
   function toggleFullscreen(){try{const target=player||document.documentElement;const request=document.fullscreenElement?document.exitFullscreen():target.requestFullscreen();Promise.resolve(request).catch(()=>showNotice('请按 F11 进入全屏，按 Esc 退出。'));}catch(_){showNotice('请按 F11 进入全屏，按 Esc 退出。');}}
   document.addEventListener('keydown',event=>{if(event.key!=='F11'||event.ctrlKey||event.altKey||event.metaKey)return;event.preventDefault();if(!event.repeat)toggleFullscreen();},true);
   let noticeTimer;

@@ -80,6 +80,17 @@ def _field(item: Any, name: str, default: Any = None) -> Any:
     return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
 
 
+def _publication_precision(video):
+    if not _field(video, 'published_at', 0):
+        return 'unknown'
+    precision = _field(video, 'published_precision', '')
+    if precision in {'second', 'day', 'relative', 'unknown'}:
+        return precision
+    if not _field(video, 'timestamp_approximate', False):
+        return 'second'
+    return 'relative' if _field(video, 'published_label', '') not in {'', '发布时间未提供'} else 'unknown'
+
+
 class Store:
     """Atomic JSON state store. Returned data is always detached from live state."""
 
@@ -109,6 +120,11 @@ class Store:
                     ) if channel.get("initialized") else None)
                 for video in data['videos']:
                     video.setdefault('platform', 'youtube' if video.get('uid', '').startswith('yt:') else 'bilibili')
+                    if video['platform'] == 'youtube':
+                        video['published_precision'] = _publication_precision(video)
+                        if video['published_precision'] == 'unknown':
+                            video['published_at'] = 0
+                data['videos'].sort(key=lambda item: (item.get('published_at', 0), item['key']), reverse=True)
                 settings = dict(DEFAULT_SETTINGS)
                 settings.update(data.get("settings", {}))
                 self._validate_settings(settings)
@@ -292,10 +308,16 @@ class Store:
                     'platform': channel.get('platform', 'bilibili'),
                     'published_label': str(_field(source, 'published_label', '') or ''),
                     'timestamp_approximate': bool(_field(source, 'timestamp_approximate', False)),
+                    'published_precision': _publication_precision(source),
                     "read": not is_new, "detected_at": checked_at,
                 }
                 if previous is not None:
                     video.update({field: previous[field] for field in ("is_new", "read", "detected_at")})
+                    rank = {'unknown': 0, 'relative': 1, 'day': 2, 'second': 3}
+                    if rank[_publication_precision(previous)] > rank[video['published_precision']]:
+                        for field in ('published_at', 'published_label', 'timestamp_approximate'):
+                            video[field] = previous.get(field, '' if field == 'published_label' else False)
+                        video['published_precision'] = _publication_precision(previous)
                 history[key] = video
                 fresh_videos.append(video)
                 if is_new:

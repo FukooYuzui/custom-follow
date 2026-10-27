@@ -60,7 +60,7 @@ class Application:
             cookies = {}
             self.warning = str(exc)
         self.client = BiliClient(cookies=cookies)
-        self.youtube = YouTubeClient()
+        self.youtube = YouTubeClient(known_videos=self.store.snapshot()['videos'])
         self.account = '已保存登录，正在验证' if cookies else ''
         self.account_valid = False
         self.window = None

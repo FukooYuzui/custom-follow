@@ -1,13 +1,13 @@
 """Read public YouTube channel updates, without keys or account credentials.
 
 Prefer the official Atom feed. If that endpoint is unavailable, read only the
-selected channel's public Videos tab. Page-derived publication times are marked
-approximate; update detection then uses the newest-first order and seen IDs.
+selected channel's public Videos tab and publication metadata. Relative dates
+remain explicitly approximate; unknown dates never become polling timestamps.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import json
 import re
 import threading
@@ -40,6 +40,7 @@ class YouTubeVideo:
     duration: str = ''
     published_label: str = ''
     timestamp_approximate: bool = False
+    published_precision: str = ''
 
 
 @dataclass(frozen=True)
@@ -104,15 +105,20 @@ def _walk(value, key):
             yield from _walk(child, key)
 
 
-def initial_data(html: str) -> dict:
-    for match in re.finditer(r'(?:var\s+)?ytInitialData\s*=\s*', html):
+def _initial_json(html: str, name: str) -> dict:
+    assignment = r'(?:var\s+)?' + re.escape(name) + r'\s*=\s*|window\[\s*[\'\"]' + re.escape(name) + r'[\'\"]\s*\]\s*=\s*'
+    for match in re.finditer(assignment, html):
         try:
             value, _ = json.JSONDecoder().raw_decode(html[match.end():].lstrip())
             if isinstance(value, dict):
                 return value
         except ValueError:
             continue
-    raise YouTubeError('YouTube 未返回可读取的频道列表。可能需要在官方页面处理验证，或页面格式已变化。')
+    raise YouTubeError('YouTube 未返回可读取的页面资料，可能需要在官方页面处理验证。')
+
+
+def initial_data(html: str) -> dict:
+    return _initial_json(html, 'ytInitialData')
 
 
 def _text(value) -> str:
@@ -133,10 +139,17 @@ def metadata(data: dict) -> tuple[str, str]:
 
 def relative_timestamp(label: str, now: float) -> float | None:
     value = label.strip().lower().replace(',', '')
-    match = re.search(r'(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago', value)
+    if value in {'just now', '刚刚', '剛剛'}:
+        return now
+    match = re.search(r'(?<![\w.])(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?|mo|years?|yrs?|y)\s*ago\b', value)
     if match:
-        seconds = {'second': 1, 'minute': 60, 'hour': 3600, 'day': 86400,
-                   'week': 604800, 'month': 2592000, 'year': 31536000}[match[2]]
+        unit = match[2]
+        seconds = (2592000 if unit.startswith(('month', 'mo')) else
+                   31536000 if unit.startswith(('year', 'yr', 'y')) else
+                   604800 if unit.startswith(('week', 'wk', 'w')) else
+                   86400 if unit.startswith(('day', 'd')) else
+                   3600 if unit.startswith(('hour', 'hr', 'h')) else
+                   60 if unit.startswith(('minute', 'min', 'm')) else 1)
         return max(0, now - int(match[1]) * seconds)
     # A page may ignore hl=en; accept common simplified/traditional labels too.
     match = re.search(r'(\d+)\s*(秒|分钟|分鐘|小时|小時|天|週|周|个月|個月|年)前', value)
@@ -145,6 +158,37 @@ def relative_timestamp(label: str, now: float) -> float | None:
                    '天': 86400, '週': 604800, '周': 604800, '个月': 2592000, '個月': 2592000, '年': 31536000}[match[2]]
         return max(0, now - int(match[1]) * seconds)
     return None
+
+
+def parse_video_publication(html: str, expected_video: str, expected_channel: str) -> dict:
+    """Read only official publication metadata, never playback/media URLs."""
+    data = _initial_json(html, 'ytInitialPlayerResponse')
+    details = data.get('videoDetails') or {}
+    microformat = data.get('microformat') or {}
+    micro = microformat.get('playerMicroformatRenderer', {}) if isinstance(microformat, dict) else {}
+    if not isinstance(details, dict) or not isinstance(micro, dict):
+        raise YouTubeError('YouTube 未提供有效的视频发布时间资料。')
+    if details.get('videoId') != expected_video or micro.get('externalChannelId') != expected_channel:
+        raise YouTubeError('YouTube 返回的视频或频道与当前关注不符。', False)
+    value = str(micro.get('publishDate') or '')
+    live = micro.get('liveBroadcastDetails') or {}
+    if not value or details.get('isUpcoming') or (isinstance(live, dict) and live.get('isLiveNow')):
+        raise YouTubeError('YouTube 暂未提供已发布视频的时间。')
+    try:
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            stamp = datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
+            precision, label = 'day', value
+        else:
+            date = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if date.tzinfo is None:
+                raise ValueError
+            stamp, precision, label = date.timestamp(), 'second', ''
+        if stamp <= 0 or stamp > time.time() + 300:
+            raise ValueError
+    except (ValueError, OverflowError, OSError):
+        raise YouTubeError('YouTube 未返回有效的视频发布时间。') from None
+    return {'published_at': stamp, 'published_precision': precision,
+            'published_label': label, 'timestamp_approximate': precision != 'second'}
 
 
 def parse_atom(xml: str, expected_id: str) -> YouTubeFeed:
@@ -194,17 +238,19 @@ def parse_video_page(html: str, expected_id: str | None = None, now: float | Non
             return cid, YouTubeFeed(name, [], order_is_freshness=True, source='channel_page')
         raise YouTubeError('YouTube 视频列表格式发生变化，本次未更新检查记录。')
     timestamp = time.time() if now is None else now
-    videos, seen = [], set()
+    videos, seen, recognized = [], set(), 0
     # Only the selected channel tab. Never inspect home-page recommendations.
     for item in (grid or legacy_grid).get('contents', (grid or legacy_grid).get('items', [])):
         inner = item.get('richItemRenderer', {}).get('content', item) if isinstance(item, dict) else {}
         lockup = inner.get('lockupViewModel')
         renderer = inner.get('videoRenderer') or inner.get('gridVideoRenderer')
+        labels = []
         if isinstance(lockup, dict) and lockup.get('contentType') == 'LOCKUP_CONTENT_TYPE_VIDEO':
             vid = str(lockup.get('contentId', ''))
             meta = lockup.get('metadata', {}).get('lockupMetadataViewModel', {})
             title = _text(meta.get('title'))
-            labels = [_text(part.get('text')) for parts in _walk(meta.get('metadata', {}), 'metadataParts') for part in parts if isinstance(part, dict)]
+            labels = [text for parts in _walk(meta.get('metadata', {}), 'metadataParts') for part in parts if isinstance(part, dict)
+                      for text in (_text(part.get('accessibilityLabel')), _text(part.get('text'))) if text]
             # Keep the label as supplied by the public page; it is approximate.
             published = next((x for x in labels if relative_timestamp(x, timestamp) is not None), '')
             duration = next((str(x.get('text', '')) for x in _walk(lockup.get('contentImage', {}), 'thumbnailBadgeViewModel') if re.fullmatch(r'\d+(?::\d{2}){1,2}', str(x.get('text', '')))), '')
@@ -215,30 +261,41 @@ def parse_video_page(html: str, expected_id: str | None = None, now: float | Non
             continue
         if not VIDEO_ID.fullmatch(vid) or vid in seen or not title:
             continue
+        recognized += 1
         # Future premieres are not yet released videos.
-        if any('scheduled' in text.lower() or 'upcoming' in text.lower() for text in [published, *(_text(x) for x in _walk(inner, 'label'))]):
+        if any(re.search(r'scheduled|upcoming|premieres in|即将|即將|预定|預定', text, re.I) for text in
+               [published, *(labels if isinstance(lockup, dict) else []), *(_text(x) for x in _walk(inner, 'label')),
+                *(_text(x) for x in _walk(inner, 'badgeStyle'))]) or (isinstance(renderer, dict) and renderer.get('upcomingEventData')):
             continue
         seen.add(vid)
         stamp = relative_timestamp(published, timestamp)
         videos.append(YouTubeVideo('yt:' + vid, title, f'https://www.youtube.com/watch?v={vid}',
-                                  stamp if stamp is not None else timestamp - len(videos), name,
+                                  stamp if stamp is not None else 0, name,
                                   f'https://i.ytimg.com/vi/{vid}/hqdefault.jpg', duration,
-                                  published or '发布时间未提供', True))
-    if not videos and (grid or legacy_grid).get('contents', (grid or legacy_grid).get('items', [])):
+                                  published or '发布时间未提供', True, 'relative' if stamp is not None else 'unknown'))
+    if not videos and not recognized and (grid or legacy_grid).get('contents', (grid or legacy_grid).get('items', [])):
         raise YouTubeError('未能识别 YouTube 频道里的视频，本次未更新检查记录。')
     return cid, YouTubeFeed(name, videos[:30], order_is_freshness=True, source='channel_page')
 
 
 class YouTubeClient:
-    def __init__(self):
+    def __init__(self, known_videos=None, metadata_budget=2):
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'en-US,en;q=0.9'})
         self._lock = threading.RLock()
         self._rss_unavailable_until = {}
+        self._publication_cache = {}
+        self._publication_retry_at = {}
+        self.metadata_budget = max(0, min(5, int(metadata_budget)))
+        for video in known_videos or []:
+            vid = youtube_video_id(video)
+            if vid and video.get('published_at', 0) > 0 and (not video.get('timestamp_approximate', False) or video.get('published_precision') == 'day'):
+                self._publication_cache[vid] = {key: video.get(key, default) for key, default in
+                    (('published_at', 0), ('published_precision', 'second'), ('published_label', ''), ('timestamp_approximate', False))}
 
-    def _get(self, url: str, *, feed=False):
+    def _get(self, url: str, *, feed=False, metadata=False):
         try:
-            response = self.session.get(url, timeout=(7, 22), allow_redirects=True)
+            response = self.session.get(url, timeout=(4, 10) if metadata else (7, 22), allow_redirects=True)
         except requests.RequestException:
             raise YouTubeError('无法连接 YouTube，请确认本机网络或代理能正常访问 YouTube，稍后自动重试。') from None
         p = urlparse(response.url)
@@ -263,21 +320,44 @@ class YouTubeClient:
                 feed = self.fetch_videos(cid)
             else:
                 cid, feed = parse_video_page(self._get(url))
-                self._rss_unavailable_until[cid] = time.time() + 3600
+                feed = self._try_atom(cid) or self._enrich_dates(feed, cid)
             return {'channel_id': cid, 'name': feed.name, 'url': f'https://www.youtube.com/channel/{cid}'}, feed
+
+    def _try_atom(self, cid):
+        if time.time() < self._rss_unavailable_until.get(cid, 0):
+            return None
+        try:
+            xml = self._get(f'https://www.youtube.com/feeds/videos.xml?channel_id={cid}', feed=True)
+            if xml is not None:
+                return parse_atom(xml, cid)
+        except YouTubeError:
+            pass
+        self._rss_unavailable_until[cid] = time.time() + 3600
+        return None
+
+    def _enrich_dates(self, feed, cid):
+        budget, videos = self.metadata_budget, []
+        for video in feed.videos:
+            vid = video.key[3:]
+            cached = self._publication_cache.get(vid)
+            if cached is None and budget and time.time() >= self._publication_retry_at.get(vid, 0):
+                budget -= 1
+                try:
+                    cached = parse_video_publication(self._get(f'https://www.youtube.com/watch?v={vid}&hl=en', metadata=True), vid, cid)
+                    self._publication_cache[vid] = cached
+                except YouTubeError:
+                    self._publication_retry_at[vid] = time.time() + 1800
+            videos.append(replace(video, **cached) if cached else video)
+        return replace(feed, videos=videos)
 
     def fetch_videos(self, cid: str, since_ts=None) -> YouTubeFeed:
         channel_key(cid)
         with self._lock:
-            if time.time() >= self._rss_unavailable_until.get(cid, 0):
-                xml = self._get(f'https://www.youtube.com/feeds/videos.xml?channel_id={cid}', feed=True)
-                if xml is not None:
-                    try:
-                        return parse_atom(xml, cid)
-                    except YouTubeError:
-                        pass
-                self._rss_unavailable_until[cid] = time.time() + 3600
+            atom = self._try_atom(cid)
+            if atom is not None:
+                return atom
             _, feed = parse_video_page(self._get(f'https://www.youtube.com/channel/{cid}/videos?hl=en'), cid)
+            feed = self._enrich_dates(feed, cid)
             if since_ts and feed.videos and all(v.published_at > since_ts for v in feed.videos):
                 return YouTubeFeed(feed.name, feed.videos, True, True, feed.source)
             return feed

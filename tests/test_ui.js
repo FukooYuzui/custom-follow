@@ -20,6 +20,12 @@ vm.runInContext(html.split('<script>')[1].split('</script>')[0],ctx);
 const snapshot={channels:[{uid:'42',name:'Bili channel',platform:'bilibili',enabled:true},{uid:yt.uid,name:'Test channel',platform:'youtube',enabled:true,channel_id:'UC'+'a'.repeat(22)}],
   videos:[yt,bili],settings:{interval_minutes:5,paused:false,popups:true,sound:false,quiet_enabled:false,quiet_start:'23:00',quiet_end:'08:00'},runtime:{}};
 ctx.receiveState(snapshot);
+const exactYT={...yt,published_at:1792167320,published_precision:'second',timestamp_approximate:false};
+assert.match(ctx.publicationText(exactYT),/2026/,'YouTube cards show the publication year');
+assert.match(ctx.publicationTitle(exactYT),/本地时间/);
+assert.match(ctx.publicationText({...yt,published_at:1792167320,published_label:'10 days ago',published_precision:'relative',timestamp_approximate:true}),/^约 /);
+assert.equal(ctx.publicationText({...yt,published_at:1792167320,published_label:'发布时间未提供',timestamp_approximate:true}),'发布时间未知','legacy check times cannot appear as publication times');
+assert.equal(ctx.publicationText({...yt,published_at:1792108800,published_label:'2026-10-16',published_precision:'day',timestamp_approximate:true}),'2026-10-16');
 assert.equal(window.document.querySelectorAll('.video-card').length,2);
 assert.equal(window.document.querySelectorAll('.video-title img').length,0,'remote titles remain plain text');
 assert.equal(window.document.querySelectorAll('.cover img').length,1,'YouTube covers are allowed');
