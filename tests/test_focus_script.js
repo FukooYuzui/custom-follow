@@ -64,6 +64,19 @@ async function run() {
   const {ctx, doc} = p;
   assert.equal(ctx.BiliFocus.status().mode, 'focus');
   assert.equal(ctx.BiliFocus.status().playerFound, true);
+  assert.ok(doc.querySelector('.bilifocus-fullscreen'), 'fullscreen has a visible entry point');
+  const fullscreenTarget=doc.getElementById('bilibili-player');
+  let fullscreenRequests=0;
+  fullscreenTarget.requestFullscreen=()=>{fullscreenRequests++;doc.fullscreenElement=fullscreenTarget;doc.dispatchEvent(new ctx.Event('fullscreenchange'));return Promise.resolve();};
+  doc.exitFullscreen=()=>{doc.fullscreenElement=null;doc.dispatchEvent(new ctx.Event('fullscreenchange'));return Promise.resolve();};
+  doc.querySelector('.bilifocus-fullscreen').click();
+  assert.equal(fullscreenRequests,1);
+  assert.ok(doc.documentElement.hasAttribute('data-bilifocus-fullscreen'));
+  ctx.BiliFocus.setHostFullscreen(true);
+  doc.exitFullscreen();
+  assert.ok(doc.documentElement.hasAttribute('data-bilifocus-fullscreen'),'host fullscreen keeps toolbar hidden after DOM transitions');
+  ctx.BiliFocus.setHostFullscreen(false);
+  assert.equal(doc.documentElement.hasAttribute('data-bilifocus-fullscreen'),false);
   assert.equal(doc.getElementById('video').parentElement.className, 'bpx-player-container', 'player DOM must not be moved');
   assert.equal(doc.getElementById('bilibili-player').parentElement.id, 'playerWrap');
   for (const selector of ['.bili-header', '.right-container', '#commentapp', '.video-toolbar-container', '#danmukuBox']) {

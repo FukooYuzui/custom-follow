@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
-from native_ui import close_window, show_window
+from native_ui import close_window, show_window, PlayerFullscreen
 
 
 BVID = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -124,6 +124,7 @@ class FocusPlayer:
         self._native_ready = False
         self._pending_clear = False
         self._native_handlers = []
+        self._fullscreen = None
         self.ready = threading.Event()
         self.last_warning = ""
         self.last_error = ""
@@ -136,6 +137,7 @@ class FocusPlayer:
             Menu("播放", [
                 MenuAction("返回关注列表", self._return),
                 MenuAction("切换专注 / 完整页面", self._toggle),
+                MenuAction("全屏 / 退出全屏 (F11)", self._toggle_fullscreen),
                 MenuAction("刷新当前视频", self._refresh),
                 MenuSeparator(),
                 MenuAction("关闭播放窗口", self.close),
@@ -245,6 +247,9 @@ class FocusPlayer:
         core.Settings.IsWebMessageEnabled = False
         core.Settings.AreDefaultContextMenusEnabled = False
         core.Settings.AreDevToolsEnabled = False
+        fullscreen = PlayerFullscreen(window, self._is_current)
+        fullscreen.install(window.native, core)
+        self._fullscreen = fullscreen
 
         def navigation_start(sender, args):
             if not self._is_current(window):
@@ -283,6 +288,7 @@ class FocusPlayer:
             }
             window.events.before_load.set()
             window.events.loaded.set()
+            fullscreen.sync_document(core)
 
         def source_changed(sender, args):
             if not self._is_current(window):
@@ -300,7 +306,7 @@ class FocusPlayer:
         view.NavigationCompleted += complete
         core.NewWindowRequested += popup
         core.SourceChanged += source_changed
-        self._native_handlers = [navigation_start, popup, complete, source_changed]
+        self._native_handlers = [navigation_start, popup, complete, source_changed, fullscreen]
         return core.AddScriptToExecuteOnDocumentCreatedAsync(script)
 
     def _copy_authorized_login(self, window):
@@ -365,6 +371,10 @@ class FocusPlayer:
                 "if(window.BiliFocus&&window.BiliFocus.toggle)window.BiliFocus.toggle();"
             ))
 
+    def _toggle_fullscreen(self):
+        if self._fullscreen:
+            self._fullscreen.toggle()
+
     def _refresh(self):
         with self._lock:
             window, target = self._window, self._target
@@ -402,6 +412,7 @@ class FocusPlayer:
                 self._native_ready = False
                 self.ready.clear()
                 self._native_handlers = []
+                self._fullscreen = None
 
     def close(self) -> None:
         with self._lock:
@@ -409,6 +420,8 @@ class FocusPlayer:
             window = self._window
             self._window = None
             self._native_ready = False
+            self._fullscreen = None
+            self._native_handlers = []
             self.ready.clear()
         if window:
             close_window(window)

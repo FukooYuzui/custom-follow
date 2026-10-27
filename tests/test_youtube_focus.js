@@ -14,6 +14,17 @@ function page(host='www.youtube.com'){
 }
 const {ctx,doc,history}=page();
 assert.equal(ctx.BiliFocus.status().mode,'focus');
+const fullscreenTarget=doc.querySelector('#movie_player');
+let fullscreenRequests=0;
+fullscreenTarget.requestFullscreen=()=>{fullscreenRequests++;doc.fullscreenElement=fullscreenTarget;doc.dispatchEvent(new ctx.Event('fullscreenchange'));return Promise.resolve();};
+doc.exitFullscreen=()=>{doc.fullscreenElement=null;doc.dispatchEvent(new ctx.Event('fullscreenchange'));return Promise.resolve();};
+doc.querySelector('.cf-yt-fullscreen').click();
+assert.equal(fullscreenRequests,1);
+assert(doc.documentElement.hasAttribute('data-cf-yt-fullscreen'));
+ctx.BiliFocus.setHostFullscreen(true);doc.exitFullscreen();
+assert(doc.documentElement.hasAttribute('data-cf-yt-fullscreen'));
+ctx.BiliFocus.setHostFullscreen(false);
+assert(!doc.documentElement.hasAttribute('data-cf-yt-fullscreen'));
 assert.equal(doc.querySelector('#movie_player').parentElement.id,'player','official player stays in its original DOM');
 assert(doc.querySelector('aside').hasAttribute('data-cf-hidden'));
 assert(doc.querySelector('header').hasAttribute('data-cf-hidden'));

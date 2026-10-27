@@ -55,6 +55,94 @@ def show_window(window) -> bool:
     return post_window(window, show)
 
 
+class PlayerFullscreen:
+    """Pair WebView2 fullscreen with the actual borderless Windows window.
+
+    Remote pages keep their Python/message bridge disabled. Native browser
+    events and accelerator keys are the only inputs to this controller.
+    """
+    def __init__(self, window, is_current):
+        self.window = window
+        self.is_current = is_current
+        self.active = False
+        self._menus = []
+        self._previous_state = None
+        self._held_keys = set()
+        self.handlers = []
+
+    def _apply(self, form, enabled):
+        if not self.is_current(self.window):
+            return
+        core = form.browser.webview.CoreWebView2
+        if not enabled and core.ContainsFullScreenElement:
+            core.ExecuteScriptAsync('if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});')
+        if self.active != enabled:
+            if enabled:
+                self._previous_state = form.WindowState
+                self._menus = [(c, bool(c.Visible)) for c in form.Controls if c.GetType().Name == 'MenuStrip']
+                for menu, _ in self._menus:
+                    menu.Visible = False
+            if bool(form.is_fullscreen) != enabled:
+                form.toggle_fullscreen()
+            if not enabled:
+                for menu, visible in self._menus:
+                    menu.Visible = visible
+                if self._previous_state is not None:
+                    form.WindowState = self._previous_state
+                self._menus = []
+            self.active = enabled
+        self.sync_document(core)
+
+    def sync_document(self, core):
+        value = 'true' if self.active else 'false'
+        core.ExecuteScriptAsync('if(window.BiliFocus&&window.BiliFocus.setHostFullscreen)'
+                                f'window.BiliFocus.setHostFullscreen({value});')
+
+    def set(self, enabled):
+        return post_window(self.window, lambda form: self._apply(form, bool(enabled)))
+
+    def toggle(self):
+        return post_window(self.window, lambda form: self._apply(form, not self.active))
+
+    def handle_key(self, key, repeated=False):
+        if key == 122:  # F11, including when the webpage consumes keyboard input.
+            if not repeated:
+                self.toggle()
+            return True
+        if key == 27 and self.active:
+            self.set(False)
+            return True
+        return False
+
+    def install(self, form, core):
+        def browser_fullscreen(sender, args):
+            self.set(bool(core.ContainsFullScreenElement))
+
+        def form_key(sender, args):
+            if args.Handled or args.Control or args.Alt:
+                return
+            key = int(args.KeyCode)
+            repeated = key in self._held_keys
+            self._held_keys.add(key)
+            if self.handle_key(key, repeated):
+                args.Handled = True
+
+        def key_up(sender, args):
+            self._held_keys.discard(int(args.KeyCode))
+
+        def deactivate(sender, args):
+            self._held_keys.clear()
+
+        form.KeyPreview = True
+        form.KeyDown += form_key
+        form.KeyUp += key_up
+        form.Deactivate += deactivate
+        core.ContainsFullScreenElementChanged += browser_fullscreen
+        form.browser.webview.KeyDown += form_key
+        form.browser.webview.KeyUp += key_up
+        self.handlers = [browser_fullscreen, form_key, key_up, deactivate]
+
+
 def install_bridge_delivery(window) -> None:
     """Don't block a bridge thread delivering a return value during shutdown.
 

@@ -58,6 +58,7 @@
   let queuedNotice = '';
   let danmakuHidden = true;
   let restoringInline = false;
+  let hostFullscreen = false;
   const hidden = new Set();
   const markedPath = new Set();
   const startedAt = Date.now();
@@ -199,6 +200,11 @@
         ensureToolbar();
       });
       bar.append(danmakuButton);
+      const fullscreenButton = element('button', 'bilifocus-fullscreen', '全屏');
+      fullscreenButton.type = 'button';
+      fullscreenButton.title = '完全全屏（F11），按 Esc 退出';
+      fullscreenButton.addEventListener('click', toggleFullscreen);
+      bar.append(fullscreenButton);
       const toggleButton = element('button', 'bilifocus-toggle', '完整页面 / 登录');
       toggleButton.type = 'button';
       toggleButton.title = '显示完整官网页面以登录或处理播放器提示；可随时返回专注模式。';
@@ -373,6 +379,22 @@
   }
   function toggle() { setMode(mode === 'full' ? 'focus' : 'full'); }
 
+  function syncFullscreen() {
+    document.documentElement.toggleAttribute('data-bilifocus-fullscreen', hostFullscreen || Boolean(document.fullscreenElement));
+  }
+  function toggleFullscreen() {
+    try {
+      const target = player || document.documentElement;
+      const request = document.fullscreenElement ? document.exitFullscreen() : target.requestFullscreen();
+      Promise.resolve(request).catch(() => showNotice('请按 F11 进入全屏，按 Esc 退出。'));
+    } catch (_) { showNotice('请按 F11 进入全屏，按 Esc 退出。'); }
+  }
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'F11' || event.ctrlKey || event.altKey || event.metaKey) return;
+    event.preventDefault();
+    if (!event.repeat) toggleFullscreen();
+  }, true);
+
   function showNotice(text) {
     queuedNotice = String(text || '').slice(0, 280);
     if (!document.body || !queuedNotice) return;
@@ -457,14 +479,14 @@
     toggle,
     focus: () => setMode('focus'),
     full: () => setMode('full'),
+    setHostFullscreen: value => { hostFullscreen = Boolean(value); syncFullscreen(); },
     showNotice,
     status: () => ({ mode, ready, playerFound:Boolean(player && player.isConnected),
       playerSelector:player ? (player.id ? '#' + player.id : '.bpx-player-container') : null,
-      hiddenBranches:hidden.size, scanCount:scans, danmakuHidden })
+      hiddenBranches:hidden.size, scanCount:scans, danmakuHidden,
+      fullscreen:hostFullscreen || Boolean(document.fullscreenElement) })
   });
-  document.addEventListener('fullscreenchange', () => {
-    document.documentElement.toggleAttribute('data-bilifocus-fullscreen', Boolean(document.fullscreenElement));
-  });
+  document.addEventListener('fullscreenchange', syncFullscreen);
   document.addEventListener('DOMContentLoaded', begin, {once:true});
   if (document.body) begin();
   else if (!document.documentElement) {

@@ -17,6 +17,7 @@
   if (!selected) return;
   const OWN = 'data-cf-owned', HIDDEN = 'data-cf-hidden', PATH = 'data-cf-path';
   let mode = 'pending', player = null, timer = 0, ready = false, scans = 0;
+  let hostFullscreen = false;
   const started = Date.now(), hidden = new Set(), ancestors = new Set(), toggled = new WeakSet();
   const style = document.createElement('style');
   style.setAttribute(OWN, '');
@@ -26,6 +27,8 @@
     html[data-cf-yt="focus"] [${HIDDEN}]{display:none!important}
     html[data-cf-yt="focus"] [${PATH}]{transform:none!important;filter:none!important;contain:none!important;overflow:visible!important}
     html[data-cf-yt="focus"] [data-cf-player]{position:fixed!important;inset:54px 0 0!important;width:100vw!important;height:calc(100vh - 54px)!important;min-width:0!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;z-index:10!important;background:#000!important}
+    html[data-cf-yt="focus"][data-cf-yt-fullscreen] [data-cf-player]{inset:0!important;height:100vh!important}
+    html[data-cf-yt="focus"] [data-cf-player]:fullscreen{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important}
     html[data-cf-yt="focus"] [data-cf-player] .html5-video-container{width:100%!important;height:100%!important}
     html[data-cf-yt="focus"] [data-cf-player] video{width:100%!important;height:100%!important;left:0!important;top:0!important;object-fit:contain!important}
     html[data-cf-yt="focus"] [data-cf-player] .ytp-chrome-bottom{left:12px!important;right:12px!important;width:calc(100% - 24px)!important}
@@ -55,7 +58,8 @@
       bar=element('div');bar.id='cf-yt-toolbar';bar.setAttribute(OWN,'');bar.setAttribute('role','region');bar.setAttribute('aria-label','YouTube 专注播放');
       const label=element('b','YouTube · 专注播放'), title=element('span');title.id='cf-yt-title';
       const toggle=element('button');toggle.type='button';toggle.addEventListener('click',()=>setMode(mode==='full'?'focus':'full'));
-      bar.append(label,title,toggle);document.body.append(bar);
+      const fullscreen=element('button','全屏');fullscreen.type='button';fullscreen.className='cf-yt-fullscreen';fullscreen.title='完全全屏（F11），按 Esc 退出';fullscreen.addEventListener('click',toggleFullscreen);
+      bar.append(label,title,toggle,fullscreen);document.body.append(bar);
     }
     bar.querySelector('#cf-yt-title').textContent=(document.title||'正在载入官方播放器').replace(/ - YouTube$/,'');
     bar.querySelector('button').textContent=mode==='full'?'返回专注模式':'完整页面 / 登录';
@@ -95,6 +99,9 @@
   }
   function schedule(){if(!timer)timer=setTimeout(scan,180);}
   function setMode(next){mode=next==='full'?'full':'pending';attach();if(mode==='full')document.getElementById('cf-yt-wait')?.remove();scan();window.dispatchEvent(new Event('resize'));}
+  function syncFullscreen(){document.documentElement.toggleAttribute('data-cf-yt-fullscreen',hostFullscreen||Boolean(document.fullscreenElement));}
+  function toggleFullscreen(){try{const target=player||document.documentElement;const request=document.fullscreenElement?document.exitFullscreen():target.requestFullscreen();Promise.resolve(request).catch(()=>showNotice('请按 F11 进入全屏，按 Esc 退出。'));}catch(_){showNotice('请按 F11 进入全屏，按 Esc 退出。');}}
+  document.addEventListener('keydown',event=>{if(event.key!=='F11'||event.ctrlKey||event.altKey||event.metaKey)return;event.preventDefault();if(!event.repeat)toggleFullscreen();},true);
   let noticeTimer;
   function showNotice(text){if(!document.body)return;let n=document.getElementById('cf-yt-notice');if(!n){n=element('div');n.id='cf-yt-notice';n.setAttribute(OWN,'');document.body.append(n);}n.textContent=String(text).slice(0,160);clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>n.remove(),6000);}
   function different(url){try{const target=new URL(url,location.href);const id=code(target.href);return Boolean(id&&id!==selected)||(['www.youtube.com','youtube.com','m.youtube.com'].includes(target.hostname)&&target.pathname==='/' );}catch(_){return true;}}
@@ -102,7 +109,8 @@
   for(const method of ['pushState','replaceState']){const original=history[method];history[method]=function(state,title,url){if(url&&different(url)){showNotice('请返回定制关注选择其他视频');return;}return original.apply(this,arguments);};}
   function begin(){if(!document.body)return;scan();const observer=new MutationObserver(records=>{if(records.some(r=>!(r.target instanceof Element)||(!r.target.closest(`[${OWN}]`)&&(!player||!player.contains(r.target)))))schedule();});observer.observe(document.body,{childList:true,subtree:true});setTimeout(schedule,2500);setTimeout(schedule,21000);}
   window.BiliFocus=Object.freeze({toggle:()=>setMode(mode==='full'?'focus':'full'),focus:()=>setMode('focus'),full:()=>setMode('full'),showNotice,
+    setHostFullscreen:value=>{hostFullscreen=Boolean(value);syncFullscreen();},
     status:()=>({mode,ready,playerFound:Boolean(player&&player.isConnected),hiddenBranches:hidden.size,scanCount:scans,platform:'youtube'})});
-  document.addEventListener('fullscreenchange',()=>document.documentElement.toggleAttribute('data-cf-yt-fullscreen',Boolean(document.fullscreenElement)));
+  document.addEventListener('fullscreenchange',syncFullscreen);
   document.addEventListener('DOMContentLoaded',begin,{once:true});if(document.body)begin();
 })();
