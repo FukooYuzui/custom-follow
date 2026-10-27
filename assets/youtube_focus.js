@@ -36,8 +36,10 @@
     html[data-cf-yt="focus"] [data-cf-player] .ytp-chrome-controls{max-width:100%!important;min-width:0!important}
     html[data-cf-yt="focus"] [data-cf-player] .ytp-right-controls{flex-shrink:0!important}
     html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu{right:12px!important;left:auto!important;bottom:84px!important;max-width:calc(100% - 24px)!important;max-height:calc(100% - 96px)!important;overflow-y:auto!important;overscroll-behavior:contain!important;box-sizing:border-box!important}
-    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu .ytp-panel-menu{max-height:calc(100vh - 204px)!important;overflow-y:auto!important;overscroll-behavior:contain!important}
-    html[data-cf-yt="focus"][data-cf-yt-fullscreen] [data-cf-player] .ytp-settings-menu .ytp-panel-menu{max-height:calc(100vh - 150px)!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu .ytp-panel{display:flex!important;flex-direction:column!important;max-height:calc(100vh - 204px)!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu .ytp-panel-header{flex-shrink:0!important}
+    html[data-cf-yt="focus"] [data-cf-player] .ytp-settings-menu .ytp-panel-menu{display:block!important;flex:1 1 auto!important;min-height:0!important;overflow-y:auto!important;overscroll-behavior:contain!important}
+    html[data-cf-yt="focus"][data-cf-yt-fullscreen] [data-cf-player] .ytp-settings-menu .ytp-panel{max-height:calc(100vh - 150px)!important}
     html[data-cf-yt="focus"] .ytp-endscreen-content,html[data-cf-yt="focus"] .ytp-ce-element,html[data-cf-yt="focus"] .ytp-pause-overlay{display:none!important}
     #cf-yt-toolbar,#cf-yt-wait,#cf-yt-notice{box-sizing:border-box!important;font:13px/1.5 "Microsoft YaHei UI",sans-serif!important;color:#e8edf7!important}
     #cf-yt-toolbar{position:fixed!important;inset:0 0 auto!important;height:54px!important;z-index:2147483000!important;display:flex!important;align-items:center!important;gap:14px!important;padding:0 18px!important;background:#171c28!important;border-bottom:1px solid #30394c!important}
