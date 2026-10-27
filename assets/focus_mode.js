@@ -57,6 +57,7 @@
   let noticeTimer = 0;
   let queuedNotice = '';
   let danmakuHidden = true;
+  let restoringInline = false;
   const hidden = new Set();
   const markedPath = new Set();
   const startedAt = Date.now();
@@ -84,9 +85,22 @@
       height:calc(100vh - 54px)!important; min-width:0!important; min-height:0!important;
       max-width:none!important; max-height:none!important; margin:0!important;
       padding:0!important; background:#000!important; box-sizing:border-box!important;
+      transform:none!important; border-radius:0!important;
     }
-    html[${ATTR}="focus"] [${ROOT}] > .bpx-player-container {
-      width:100%!important; height:100%!important; min-height:0!important;
+    /* The official player nests its surface inside .bpx-docker-major. Its
+       mini state otherwise keeps a fixed 320/360 px surface in the corner. */
+    html[${ATTR}="focus"] [${ROOT}] .bpx-player-container {
+      position:absolute!important; inset:0!important;
+      width:100%!important; height:100%!important; min-width:0!important; min-height:0!important;
+      max-width:none!important; max-height:none!important; margin:0!important;
+      transform:none!important; border-radius:0!important;
+    }
+    html[${ATTR}="focus"][data-bilifocus-fullscreen] [${ROOT}] {
+      inset:0!important; width:100vw!important; height:100vh!important;
+    }
+    html[${ATTR}="focus"] [${ROOT}]:fullscreen,
+    html[${ATTR}="focus"] [${ROOT}] .bpx-player-container:fullscreen {
+      position:fixed!important; inset:0!important; width:100vw!important; height:100vh!important;
     }
     html[${ATTR}="focus"] [${ROOT}] .bpx-player-primary-area { height:100%!important; }
     html[${ATTR}="focus"] [${ROOT}] .bpx-player-sending-area,
@@ -300,6 +314,22 @@
     }
   }
 
+  function restoreInlinePlayer() {
+    // Only correct the website's scroll-triggered mini layout. Native/browser
+    // fullscreen and picture-in-picture remain under the viewer's control.
+    if (mode !== 'focus' || restoringInline || document.fullscreenElement ||
+        document.pictureInPictureElement || !player) return;
+    const surface = player.matches('.bpx-player-container') ? player : player.querySelector('.bpx-player-container');
+    if (!surface || surface.getAttribute('data-screen') !== 'mini') return;
+    const api = window.player;
+    const normal = window.nano && window.nano.ScreenKind && window.nano.ScreenKind.Normal;
+    if (!api || typeof api.requestStatue !== 'function' || normal == null) return;
+    restoringInline = true;
+    try {
+      Promise.resolve(api.requestStatue(normal)).catch(() => {}).finally(() => { restoringInline = false; });
+    } catch (_) { restoringInline = false; }
+  }
+
   function scan() {
     scanTimer = 0;
     if (!document.documentElement || !document.body) return;
@@ -319,6 +349,7 @@
       const waiting = document.getElementById(WAIT_ID);
       if (waiting) waiting.remove();
       isolate();
+      restoreInlinePlayer();
     } else {
       mode = Date.now() - startedAt >= 20000 ? 'failed' : 'pending';
       document.documentElement.setAttribute(ATTR, mode);
@@ -407,12 +438,18 @@
       const relevant = records.some(record => {
         const target = record.target;
         if (target instanceof Element && target.closest(`[${OWN}]`)) return false;
+        if (record.type === 'attributes') {
+          return mode === 'focus' && record.attributeName === 'data-screen' &&
+            target instanceof Element && target.matches('.bpx-player-container');
+        }
         // Danmaku/video controls may mutate continuously; do not rescan for them.
-        return !player || !player.contains(target);
+        return !player || !player.contains(target) ||
+          [...record.addedNodes, ...record.removedNodes].some(node => node instanceof Element &&
+            (node.matches('.bpx-player-container') || node.querySelector('.bpx-player-container')));
       });
       if (relevant) scheduleScan();
     });
-    observer.observe(document.body, {childList:true, subtree:true});
+    observer.observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['data-screen']});
     setTimeout(scheduleScan, 2000);
     setTimeout(scheduleScan, 21000);
   }

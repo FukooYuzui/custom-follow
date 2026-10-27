@@ -22,6 +22,7 @@ function page(html, options = {}) {
     clearTimeout: timer => timers.delete(timer),
     dispatchEvent: () => {},
     history: {pushes: [], pushState(...args) {this.pushes.push(args);}, replaceState(...args) {this.pushes.push(args);}},
+    ...options.globals,
   };
   ctx.window = ctx;
   ctx.self = ctx;
@@ -101,6 +102,37 @@ async function run() {
   festival.ctx.history.pushState(null, '', '?bvid=BV1GJ411x7h7');
   festival.ctx.history.pushState(null, '', '/festival/NobelPrize2026');
   assert.equal(festival.ctx.history.pushes.length, 1, 'activity-page recommendations and aggregate routes must be blocked');
+
+  const miniCalls=[];
+  const mini=page('<html><head><title>Nested player</title></head><body><div id="bilibili-player"><div class="bpx-docker-major"><div class="bpx-player-container" data-screen="mini"><video></video><button class="quality">画质</button></div></div></div></body></html>', {
+    globals:{player:{requestStatue:kind=>{miniCalls.push(kind);return Promise.resolve();}},nano:{ScreenKind:{Normal:0}}}
+  });
+  assert.deepEqual(miniCalls,[0],'entering focus restores the official normal layout from mini');
+  await mini.advance(0);
+  const surface=mini.doc.querySelector('.bpx-player-container');
+  mini.ctx.BiliFocus.full();
+  surface.setAttribute('data-screen','normal');
+  surface.setAttribute('data-screen','mini');
+  await mini.advance(200);
+  assert.deepEqual(miniCalls,[0],'full official page retains its own mini behavior');
+  mini.ctx.BiliFocus.focus();
+  await mini.advance(0);
+  assert.deepEqual(miniCalls,[0,0],'returning to focus restores the full player');
+  surface.setAttribute('data-screen','normal');
+  await mini.advance(200);
+  surface.setAttribute('data-screen','mini');
+  await mini.advance(0);
+  await mini.advance(200);
+  assert.deepEqual(miniCalls,[0,0,0],'a late mini transition inside the player must also be corrected');
+  mini.doc.fullscreenElement=surface;
+  surface.setAttribute('data-screen','full');
+  await mini.advance(200);
+  assert.deepEqual(miniCalls,[0,0,0],'native fullscreen remains untouched');
+  mini.doc.fullscreenElement=null;
+  mini.doc.pictureInPictureElement=mini.doc.querySelector('video');
+  surface.setAttribute('data-screen','mini');
+  await mini.advance(200);
+  assert.deepEqual(miniCalls,[0,0,0],'browser picture-in-picture remains untouched');
 
   const portal = doc.getElementById('portal');
   assert.ok(portal.hasAttribute('data-bilifocus-hidden'));
