@@ -1,8 +1,10 @@
 """Only locally subscribed videos can reach the official remote player."""
 import unittest
+import threading
 from unittest.mock import Mock
 
-from main import Api
+from main import Api, Application
+from playback_queue import FollowedQueue
 
 
 class OfficialPlayerApiTests(unittest.TestCase):
@@ -12,14 +14,19 @@ class OfficialPlayerApiTests(unittest.TestCase):
         self.app.playback_allowed = True
         self.app.request.side_effect = lambda function, *args, **kwargs: function(*args, **kwargs)
         self.video = dict(key='BV1cpJ86BEys', title='Fixture', uid='254463269')
-        self.app.store.snapshot.return_value = {'videos': [self.video]}
+        self.app.store.snapshot.return_value = {'videos': [self.video], 'channels': [{'uid':self.video['uid']}]}
+        self.app.play_queue = FollowedQueue(self.app.store.snapshot)
+        self.app.play_operation = threading.Lock()
+        self.app.focus_player._fullscreen = self.app.youtube_player._fullscreen = None
+        self.app.play_ticket = lambda ticket, part=1: Application.play_ticket(self.app, ticket, part)
         self.api = Api(self.app)
 
     def test_only_current_subscriptions_can_open_official_player(self):
         self.assertFalse(self.api.open_focus_video('BV1B7411m7LV')['ok'])
         self.app.focus_player.open.assert_not_called()
         self.assertTrue(self.api.open_focus_video(self.video['key'], 2)['ok'])
-        self.app.focus_player.open.assert_called_once_with(self.video['key'], 'Fixture', 2)
+        self.app.focus_player.open.assert_called_once_with(self.video['key'], 'Fixture', 2,
+                                                         playback={'key':self.video['key'],'revision':1})
         self.app.store.mark_read.assert_called_once_with(self.video['key'])
 
     def test_bad_part_never_enters_remote_url(self):

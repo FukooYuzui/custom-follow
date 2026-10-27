@@ -24,6 +24,7 @@ DEFAULT_SETTINGS = {
     "popups": True,
     "sound": False,
     "quiet_enabled": False,
+    "autoplay_followed": True,
     "quiet_start": "23:00",
     "quiet_end": "08:00",
 }
@@ -172,7 +173,7 @@ class Store:
         interval = settings.get("interval_minutes", 5)
         if isinstance(interval, bool) or not isinstance(interval, (float, int)) or not math.isfinite(interval) or int(interval) != interval or not 3 <= interval <= 60:
             raise ValueError("检查间隔应为 3 至 60 分钟的整数。")
-        for name in ("paused", "popups", "sound", "quiet_enabled"):
+        for name in ("paused", "popups", "sound", "quiet_enabled", "autoplay_followed"):
             if not isinstance(settings.get(name), bool):
                 raise ValueError("开关设置值必须是布尔值。")
         _clock_minutes(settings.get("quiet_start"))

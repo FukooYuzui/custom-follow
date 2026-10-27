@@ -7,6 +7,8 @@ than synchronously invoked, including acknowledgements from its pinned bridge.
 from __future__ import annotations
 
 import logging
+import json
+import threading
 
 
 def post_window(window, action) -> bool:
@@ -55,6 +57,75 @@ def show_window(window) -> bool:
     return post_window(window, show)
 
 
+class PlaybackWatcher:
+    """Read a bounded playback sample asynchronously; expose no page RPC."""
+    def __init__(self, window, is_current, config, on_signal):
+        self.window, self.is_current = window, is_current
+        self.config, self.on_signal = config, on_signal
+        self.pending = False
+        self.token, self.action_seq, self.ended_sent = '', 0, False
+        self.timer = None
+        self.handlers = []
+
+    def install(self, form, core):
+        from System import Action, String
+        from System.Threading.Tasks import Task
+        from System.Windows.Forms import Timer
+        timer = Timer()
+        timer.Interval = 500
+        self.timer = timer
+
+        def signal(config, kind, data):
+            threading.Thread(target=self.on_signal, args=(config, kind, data),
+                             name='followed-playback', daemon=True).start()
+
+        def tick(sender, args):
+            if self.pending or not self.is_current(self.window):
+                return
+            config = self.config()
+            if not config:
+                return
+            if self.token != config['token']:
+                self.token, self.action_seq, self.ended_sent = config['token'], 0, False
+            script = 'window.CustomFollowPlayback?window.CustomFollowPlayback.observe(' + json.dumps(config, ensure_ascii=True) + '):null'
+            self.pending = True
+            def complete(task):
+                self.pending = False
+                try:
+                    current = self.config() if self.is_current(self.window) else None
+                    if not current or current['token'] != config['token']:
+                        return
+                    sample = json.loads(str(task.Result))
+                    if not isinstance(sample, dict) or sample.get('token') != config['token'] or sample.get('code') != config['code']:
+                        return
+                    if sample.get('unexpected'):
+                        core.ExecuteScriptAsync("window.BiliFocus?.showNotice('已停止清单外的视频，请返回关注列表选择作品。')")
+                        return
+                    action = sample.get('action')
+                    if isinstance(action, dict) and type(action.get('seq')) is int and action['seq'] > self.action_seq:
+                        self.action_seq = action['seq']
+                        if action.get('name') in ('autoplay', 'next'):
+                            signal(config, action['name'], action)
+                        return
+                    if sample.get('ended') is True and current['autoplay'] and not self.ended_sent:
+                        self.ended_sent = True
+                        signal(config, 'ended', sample)
+                except Exception as exc:
+                    logging.debug('Playback sample unavailable (%s)', type(exc).__name__)
+            try:
+                core.ExecuteScriptAsync(script).ContinueWith(Action[Task[String]](complete), form.browser.syncContextTaskScheduler)
+            except Exception:
+                self.pending = False
+
+        def closed(sender, args):
+            timer.Stop()
+            timer.Dispose()
+        timer.Tick += tick
+        form.FormClosed += closed
+        self.handlers = [tick, closed]
+        timer.Start()
+
+
 class PlayerFullscreen:
     """Pair WebView2 fullscreen with the actual borderless Windows window.
 
@@ -68,12 +139,15 @@ class PlayerFullscreen:
         self._menus = []
         self._previous_state = None
         self._held_keys = set()
+        self.preserve_navigation = False
         self.handlers = []
 
     def _apply(self, form, enabled):
         if not self.is_current(self.window):
             return
         core = form.browser.webview.CoreWebView2
+        if not enabled:
+            self.preserve_navigation = False
         if not enabled and core.ContainsFullScreenElement:
             core.ExecuteScriptAsync('if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});')
         if self.active != enabled:
@@ -116,6 +190,8 @@ class PlayerFullscreen:
 
     def install(self, form, core):
         def browser_fullscreen(sender, args):
+            if not core.ContainsFullScreenElement and self.preserve_navigation:
+                return
             self.set(bool(core.ContainsFullScreenElement))
 
         def form_key(sender, args):

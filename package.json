@@ -1,10 +1,10 @@
 {
   "name": "custom-follow",
-  "version": "1.1.5",
+  "version": "1.2.0",
   "private": true,
   "description": "定制关注 · 把想看的 B站与 YouTube 博主放在一起",
   "scripts": {
-    "test": "node tests/test_focus_script.js && node tests/test_youtube_focus.js && node tests/test_ui.js"
+    "test": "node tests/test_focus_script.js && node tests/test_youtube_focus.js && node tests/test_ui.js && node tests/test_playback_script.js"
   },
   "devDependencies": {
     "linkedom": "0.18.14"

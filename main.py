@@ -27,6 +27,7 @@ from windows_support import (Tray, acquire_instance, release_instance, save_sess
 from focus_player import FocusPlayer
 from youtube_api import YouTubeClient, YouTubeError, youtube_video_id
 from native_ui import post_window, post_js, close_window, show_window, install_bridge_delivery
+from playback_queue import FollowedQueue, PlayTicket, owned_videos
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'assets'
@@ -84,12 +85,100 @@ class Application:
         self.last_search = 0
         self.lifecycle_lock = threading.Lock()
         self.playback_allowed = '--background' not in sys.argv
+        self.play_queue = FollowedQueue(self.store.snapshot)
+        self.play_operation = threading.Lock()
+        self.autoplay_followed = self.store.snapshot()['settings']['autoplay_followed']
         can_open = lambda: self.playback_allowed and not self.quitting
-        self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player, can_open=can_open)
-        self.youtube_player = FocusPlayer(ASSETS, lambda: {}, self.return_from_player, platform='youtube', can_open=can_open)
+        playback = dict(playback_config=self.playback_config, on_playback=self.playback_signal, on_closed=self.playback_closed)
+        self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player, can_open=can_open, **playback)
+        self.youtube_player = FocusPlayer(ASSETS, lambda: {}, self.return_from_player, platform='youtube', can_open=can_open, **playback)
 
     def playback_cookies(self):
         return load_session(DATA / 'session.bin')
+
+    def playback_config(self, context):
+        ticket = PlayTicket(context['revision'], context['key'])
+        if self.quitting or not self.playback_allowed or not self.play_queue.matches(ticket):
+            return None
+        return dict(key=ticket.key, revision=ticket.revision, token=f'{ticket.revision}:{ticket.key}',
+                    autoplay=self.autoplay_followed, remaining=self.play_queue.remaining(ticket), start=True)
+
+    def set_autoplay(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError('自动连播开关必须为开或关。')
+        self.store.update_settings({'autoplay_followed': enabled})
+        self.autoplay_followed = enabled
+        self.changed()
+
+    def playback_closed(self, context):
+        ticket = PlayTicket(context['revision'], context['key'])
+        if self.play_queue.cancel(ticket):
+            self.emit('stopPlayerFromHost', None)
+
+    def play_ticket(self, ticket, part=1):
+        with self.play_operation:
+            if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
+                raise AppClosing()
+            video = owned_videos(self.store.snapshot()).get(ticket.key)
+            if video is None:
+                self.play_queue.cancel(ticket)
+                raise ValueError('该视频或博主已不在你的关注清单。')
+            context = {'key': ticket.key, 'revision': ticket.revision}
+            managers = (self.focus_player, self.youtube_player)
+            keep_fullscreen = any(m._fullscreen and m._fullscreen.active for m in managers)
+            if youtube_video_id(video):
+                self.focus_player.close()
+                manager = self.youtube_player
+                self.request(manager.open, youtube_video_id(video), video['title'], playback=context)
+            else:
+                self.youtube_player.close()
+                manager = self.focus_player
+                self.request(manager.open, video_bvid(video), video['title'], int(part), playback=context)
+            if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
+                manager.close()
+                raise AppClosing()
+            if keep_fullscreen:
+                def restore():
+                    if manager.ready.wait(15) and self.play_queue.matches(ticket) and manager._fullscreen:
+                        manager._fullscreen.set(True)
+                threading.Thread(target=restore, daemon=True, name='continue-fullscreen').start()
+            self.store.mark_read(ticket.key)
+            self.changed()
+            return {'ok': True, 'video': video, 'bvid': video_bvid(video), 'video_id': youtube_video_id(video),
+                    'platform': video.get('platform', 'bilibili'), 'part': int(part), 'order': list(self.play_queue.order), 'revision': ticket.revision}
+
+    def playback_signal(self, config, kind, sample):
+        ticket = PlayTicket(config['revision'], config['key'])
+        if not self.playback_config(config):
+            return
+        try:
+            if kind == 'autoplay':
+                self.set_autoplay(sample.get('value'))
+                return
+            if kind == 'ended' and not self.autoplay_followed:
+                return
+            if kind not in ('next', 'ended'):
+                return
+            part, pages = sample.get('part'), sample.get('pages')
+            if kind == 'ended' and not ticket.key.startswith('yt:') and type(part) is int and type(pages) is int and 1 <= part < pages <= 999:
+                next_ticket = self.play_queue.next_part(ticket)
+                next_part = part + 1
+            else:
+                next_ticket = self.play_queue.move(ticket)
+                next_part = 1
+            if next_ticket is None:
+                if self.play_queue.matches(ticket):
+                    manager = self.youtube_player if ticket.key.startswith('yt:') else self.focus_player
+                    post_js(manager._window, "window.BiliFocus?.showNotice('当前关注清单已播完。')")
+                return
+            result = self.play_ticket(next_ticket, next_part)
+            if self.play_queue.matches(next_ticket):
+                self.emit('playbackAdvanced', dict(result, previous_key=ticket.key))
+        except AppClosing:
+            pass
+        except Exception:
+            logging.exception('Followed playback could not continue')
+            self.emit('playbackError', '下一条视频未能打开，请手动重试；播放清单仍只包含你的关注。')
 
     def request(self, function, *args, **kwargs):
         """Let an RPC caller stop waiting when the application is closing.
@@ -130,7 +219,7 @@ class Application:
         data = self.store.snapshot()
         data['runtime'] = {'account': self.account, 'account_valid': self.account_valid,
                            'warning': self.warning, 'checking': self.checking,
-                           'tray': self.tray_ok, 'autostart': get_autostart()}
+                           'tray': self.tray_ok, 'autostart': get_autostart(), 'playback_revision': self.play_queue.revision}
         return data
 
     def emit(self, method, value):
@@ -152,6 +241,7 @@ class Application:
             if self.quitting or not self.tray_ok:
                 return False
             self.playback_allowed = False
+        self.play_queue.cancel()
         # This callback may run on the GUI thread: enqueue work and return.
         # Do not evaluate_js, Invoke, join, or wait for a renderer here.
         def hide(form):
@@ -182,6 +272,7 @@ class Application:
             self.playback_allowed = False
             self.stopping.set()
             self.wake.set()
+        self.play_queue.cancel()
         self.focus_player.close()
         self.youtube_player.close()
         if self.tray:
@@ -374,6 +465,9 @@ class Api:
 
     def remove_channel(self, uid):
         self._app.store.remove_channel(str(uid))
+        current = self._app.play_queue.current
+        if current and current not in owned_videos(self._app.store.snapshot()):
+            self.close_focus_video()
         self._app.changed()
         return {'ok': True}
 
@@ -388,6 +482,7 @@ class Api:
             settings = dict(settings)
             autostart = settings.pop('autostart', None)
             self._app.store.update_settings(settings)
+            self._app.autoplay_followed = self._app.store.snapshot()['settings']['autoplay_followed']
             if autostart is not None:
                 set_autostart(bool(autostart))
             self._app.wake.set()
@@ -426,7 +521,7 @@ class Api:
         elif video and youtube_video_id(video):
             webbrowser.open('https://www.youtube.com/watch?v=' + youtube_video_id(video))
 
-    def open_focus_video(self, key, part=1):
+    def open_focus_video(self, key, part=1, order=None):
         if self._app.quitting or not self._app.playback_allowed:
             return {'ok': False, 'error': '播放已停止；请打开主窗口后再选择视频。'}
         video = next((v for v in self._app.store.snapshot()['videos'] if v['key'] == key), None)
@@ -435,15 +530,8 @@ class Api:
         if isinstance(part, bool) or not isinstance(part, (int, float)) or not math.isfinite(part) or int(part) != part or not 1 <= part <= 999:
             return {'ok': False, 'error': '分 P 序号应为 1 至 999 的整数。'}
         try:
-            if youtube_video_id(video):
-                self._app.focus_player.close()
-                self._app.request(self._app.youtube_player.open, youtube_video_id(video), video['title'])
-            else:
-                self._app.youtube_player.close()
-                self._app.request(self._app.focus_player.open, video_bvid(video), video['title'], int(part))
-            self._app.store.mark_read(key)
-            self._app.changed()
-            return {'ok': True, 'video': video, 'bvid': video_bvid(video), 'video_id': youtube_video_id(video), 'platform': video.get('platform', 'bilibili')}
+            ticket = self._app.play_queue.start(key, order)
+            return self._app.play_ticket(ticket, int(part))
         except AppClosing as exc:
             return {'ok': False, 'error': str(exc)}
         except Exception:
@@ -451,9 +539,17 @@ class Api:
             return {'ok': False, 'error': '官方播放窗口未能打开，请稍后重试，或切换到嵌入备用模式。'}
 
     def close_focus_video(self):
+        self._app.play_queue.cancel()
         self._app.focus_player.close()
         self._app.youtube_player.close()
         return {'ok': True}
+
+    def set_autoplay(self, enabled):
+        try:
+            self._app.set_autoplay(enabled)
+            return {'ok': True}
+        except (ValueError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)}
 
     def open_space(self, uid):
         channel = next((c for c in self._app.store.snapshot()['channels'] if c['uid'] == str(uid)), None)
@@ -549,6 +645,9 @@ def run():
         ctypes.windll.user32.MessageBoxW(None, '程序已经在运行。请点击右下角托盘中的粉色电视图标打开。', '定制关注', 64)
         return
     try:
+        arguments = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
+        if '--autoplay-policy=' not in arguments:
+            os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = arguments + ' --autoplay-policy=no-user-gesture-required'
         DATA.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(DATA / 'app.log', maxBytes=500_000, backupCount=2, encoding='utf-8')
         logging.basicConfig(level=logging.WARNING, handlers=[handler])

@@ -35,7 +35,7 @@ class YouTubeAppTests(unittest.TestCase):
         result=self.api.play_video('yt:'+VID)
         self.assertEqual(VID,result['video_id'])
         self.assertTrue(self.api.open_focus_video('yt:'+VID)['ok'])
-        self.app.youtube_player.open.assert_called_once_with(VID,'Fixture')
+        self.app.youtube_player.open.assert_called_once_with(VID,'Fixture',playback={'key':'yt:'+VID,'revision':1})
         self.app.focus_player.open.assert_not_called()
 
     def test_only_explicitly_stored_youtube_videos_can_open(self):

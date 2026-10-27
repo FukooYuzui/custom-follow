@@ -40,8 +40,10 @@ ctx.pywebview={api:{
 async function run(){
   await ctx.openVideo(yt.key);
   assert(calls.some(c=>c[0]==='focus'&&c[1]===yt.key));
+  assert.deepEqual(Array.from(calls.find(c=>c[0]==='focus')[3]),[yt.key],'only the currently filtered list is sent to the host queue');
   assert.equal(window.document.getElementById('episodeControls').hidden,true);
   await ctx.selectPlaybackMode('embed');
+  assert.equal(window.document.getElementById('autoplayFollowed').disabled,true,'backup embedded mode does not promise native queue automation');
   const frame=window.document.querySelector('#playerShell iframe');
   assert.equal(frame.getAttribute('src'),'https://www.youtube.com/embed/AAAAAAAAAAA?autoplay=0&rel=0');
   assert(calls.some(c=>c[0]==='close'),'changing player modes closes the other window');

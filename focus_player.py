@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
-from native_ui import close_window, show_window, PlayerFullscreen
+from native_ui import close_window, show_window, PlayerFullscreen, PlaybackWatcher
 
 
 BVID = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -108,7 +108,8 @@ def _delete_login_cookies(core) -> None:
 
 
 class FocusPlayer:
-    def __init__(self, assets_path: Path, cookie_provider, on_return, platform='bilibili', can_open=None):
+    def __init__(self, assets_path: Path, cookie_provider, on_return, platform='bilibili', can_open=None,
+                 playback_config=None, on_playback=None, on_closed=None):
         if platform not in {'bilibili', 'youtube'}:
             raise ValueError('不支持的播放平台。')
         self.platform = platform
@@ -116,6 +117,10 @@ class FocusPlayer:
         self.cookie_provider = cookie_provider
         self.on_return = on_return
         self.can_open = can_open or (lambda: True)
+        self.playback_config = playback_config
+        self.on_playback, self.on_closed = on_playback, on_closed
+        self._playback_context = None
+        self._navigation_pending = False
         self._lock = threading.RLock()
         self._open_lock = threading.Lock()
         self._generation = 0
@@ -144,11 +149,13 @@ class FocusPlayer:
             ])
         ]
 
-    def open(self, bvid: str, title: str = "", part: int = 1) -> None:
+    def open(self, bvid: str, title: str = "", part: int = 1, playback=None) -> None:
         url = youtube_url(bvid) if self.platform == 'youtube' else video_url(bvid, part)
         script = (self.assets_path / ('youtube_focus.js' if self.platform == 'youtube' else 'focus_mode.js')).read_text(encoding="utf-8")
         if not script.strip():
             raise ValueError("专注播放资源缺失，请重新安装程序。")
+        if self.playback_config:
+            script += '\n' + (self.assets_path / 'playback_queue.js').read_text(encoding='utf-8')
         display_title = str(title or "B站视频").replace("\r", " ").replace("\n", " ")[:100]
         with self._lock:
             requested_generation = self._generation
@@ -157,10 +164,13 @@ class FocusPlayer:
         # state lock, and waiting on it during create_window can deadlock.
         with self._open_lock:
             with self._lock:
-                if requested_generation != self._generation or not self.can_open():
+                allowed = self.can_open() and (not playback or not self.playback_config or bool(self.playback_config(playback)))
+                if requested_generation != self._generation or not allowed:
                     return
                 generation = self._generation
                 self._target = (bvid, url, display_title)
+                self._playback_context = dict(playback) if playback else None
+                self._navigation_pending = True
                 window = self._window
             if window is None:
                 window = webview.create_window(
@@ -172,7 +182,8 @@ class FocusPlayer:
                 if window is None:
                     raise RuntimeError("无法创建播放窗口。")
                 with self._lock:
-                    cancelled = generation != self._generation or not self.can_open()
+                    allowed = self.can_open() and (not playback or not self.playback_config or bool(self.playback_config(playback)))
+                    cancelled = generation != self._generation or not allowed
                     if not cancelled:
                         self.ready.clear()
                         self.last_error = ""
@@ -250,6 +261,19 @@ class FocusPlayer:
         fullscreen = PlayerFullscreen(window, self._is_current)
         fullscreen.install(window.native, core)
         self._fullscreen = fullscreen
+        watcher = None
+        if self.playback_config and self.on_playback:
+            def config():
+                with self._lock:
+                    context = self._playback_context
+                    target = self._target
+                    pending = self._navigation_pending
+                if pending or not context or not target or not self.can_open():
+                    return None
+                result = self.playback_config(context)
+                return dict(result, code=target[0]) if result else None
+            watcher = PlaybackWatcher(window, self._is_current, config, self.on_playback)
+            watcher.install(window.native, core)
 
         def navigation_start(sender, args):
             if not self._is_current(window):
@@ -288,7 +312,11 @@ class FocusPlayer:
             }
             window.events.before_load.set()
             window.events.loaded.set()
+            with self._lock:
+                if self._window is window:
+                    self._navigation_pending = False
             fullscreen.sync_document(core)
+            fullscreen.preserve_navigation = False
 
         def source_changed(sender, args):
             if not self._is_current(window):
@@ -306,7 +334,7 @@ class FocusPlayer:
         view.NavigationCompleted += complete
         core.NewWindowRequested += popup
         core.SourceChanged += source_changed
-        self._native_handlers = [navigation_start, popup, complete, source_changed, fullscreen]
+        self._native_handlers = [navigation_start, popup, complete, source_changed, fullscreen, watcher]
         return core.AddScriptToExecuteOnDocumentCreatedAsync(script)
 
     def _copy_authorized_login(self, window):
@@ -333,6 +361,9 @@ class FocusPlayer:
             return
         if copy_login:
             self._copy_authorized_login(window)
+        self._navigation_pending = True
+        if self._fullscreen:
+            self._fullscreen.preserve_navigation = self._fullscreen.active
         window.set_title("官方网页专注播放 · " + title)
         window.load_url(url)
 
@@ -405,23 +436,32 @@ class FocusPlayer:
         self.on_return()
 
     def _on_closed(self, window):
+        context = None
         with self._lock:
             if self._window is window:
+                context = self._playback_context
                 self._generation += 1
                 self._window = None
                 self._native_ready = False
                 self.ready.clear()
                 self._native_handlers = []
                 self._fullscreen = None
+                self._playback_context = None
+        if context and self.on_closed:
+            self.on_closed(context)
 
     def close(self) -> None:
         with self._lock:
             self._generation += 1
             window = self._window
+            context = self._playback_context
             self._window = None
             self._native_ready = False
             self._fullscreen = None
             self._native_handlers = []
+            self._playback_context = None
             self.ready.clear()
+        if context and self.on_closed:
+            self.on_closed(context)
         if window:
             close_window(window)
