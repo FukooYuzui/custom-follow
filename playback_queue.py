@@ -1,5 +1,7 @@
 """Finite playback order containing only locally saved creators and videos."""
 from dataclasses import dataclass
+import hashlib
+import json
 import re
 import threading
 
@@ -83,10 +85,51 @@ class FollowedQueue:
             return PlayTicket(self.revision, ticket.key)
 
     def remaining(self, ticket):
+        """Count currently eligible future entries; reads a store snapshot.
+
+        Native GUI callbacks must use a host-maintained cached view rather than
+        call this method while another thread might be saving the store.
+        """
+        return self.view(ticket)['remaining']
+
+    def view(self, ticket):
+        """Return a detached display view of the current and upcoming works.
+
+        Store reads deliberately precede the queue lock so a stalled disk write
+        cannot prevent close/cancel from invalidating an in-flight request.
+        """
+        videos = owned_videos(self.snapshot())
+        items = []
         with self._lock:
-            if not self.matches(ticket) or ticket.key not in self.order:
-                return 0
-            return len(self.order) - self.order.index(ticket.key) - 1
+            if self.matches(ticket) and ticket.key in self.order:
+                for key in self.order[self.order.index(ticket.key):]:
+                    video = videos.get(key)
+                    if video is None or (key != ticket.key and self.unwatched_only and video.get('watched', False)):
+                        continue
+                    items.append({
+                        'key': key,
+                        'title': str(video.get('title') or '未命名视频')[:200],
+                        'author': str(video.get('author') or '博主')[:100],
+                        'platform': 'youtube' if key.startswith('yt:') else 'bilibili',
+                        'watched': bool(video.get('watched', False)),
+                        'current': key == ticket.key,
+                    })
+        payload = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        return {'version': hashlib.sha256(payload).hexdigest()[:20], 'items': items,
+                'remaining': sum(not item['current'] for item in items)}
+
+    def select(self, ticket, key):
+        """Select only an eligible upcoming work from this exact queue lease."""
+        videos = owned_videos(self.snapshot())
+        with self._lock:
+            if (not isinstance(key, str) or not self.matches(ticket) or key == ticket.key or
+                    ticket.key not in videos or ticket.key not in self.order or key not in videos or
+                    key not in self.order or self.order.index(key) <= self.order.index(ticket.key) or
+                    self.unwatched_only and videos[key].get('watched', False)):
+                return None
+            self.revision += 1
+            self.current, self.finished = key, False
+            return PlayTicket(self.revision, key)
 
     def cancel(self, ticket=None):
         with self._lock:

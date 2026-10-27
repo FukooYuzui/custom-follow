@@ -106,7 +106,7 @@ class PlaybackWatcher:
                     action = sample.get('action')
                     if isinstance(action, dict) and type(action.get('seq')) is int and action['seq'] > self.action_seq:
                         self.action_seq = action['seq']
-                        if action.get('name') in ('autoplay', 'next'):
+                        if action.get('name') in ('autoplay', 'next', 'select', 'cancel'):
                             signal(config, action['name'], action)
                         return
                     if sample.get('ended') is True and (not self.completion_sent or current['autoplay'] and not self.ended_sent):

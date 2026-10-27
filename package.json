@@ -1,6 +1,6 @@
 {
   "name": "custom-follow",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "description": "定制关注 · 把想看的 B站与 YouTube 博主放在一起",
   "scripts": {

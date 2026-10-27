@@ -93,6 +93,9 @@ class Application:
         self.embedded_active = False
         self.schedule_wake = threading.Event()
         self.schedule_starting = None
+        self.playback_view = {'revision': -1, 'queue': {'version': '', 'items': [], 'remaining': 0}}
+        self.playback_view_lock = threading.Lock()
+        self.play_transition = None
         can_open = lambda: self.playback_allowed and not self.quitting
         playback = dict(playback_config=self.playback_config, on_playback=self.playback_signal, on_closed=self.playback_closed)
         self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player, can_open=can_open, **playback)
@@ -105,8 +108,21 @@ class Application:
         ticket = PlayTicket(context['revision'], context['key'])
         if self.quitting or not self.playback_allowed or not self.play_queue.matches(ticket):
             return None
-        return dict(key=ticket.key, revision=ticket.revision, token=f'{ticket.revision}:{ticket.key}',
-                    autoplay=self.autoplay_followed, remaining=self.play_queue.remaining(ticket), start=True)
+        cached = self.playback_view
+        queue = cached['queue'] if cached['revision'] == ticket.revision else {'version': '', 'items': [], 'remaining': 0}
+        result = dict(key=ticket.key, revision=ticket.revision, token=f'{ticket.revision}:{ticket.key}',
+                      autoplay=self.autoplay_followed, remaining=queue['remaining'], queue=queue, start=True)
+        if context.get('transition'):
+            result['transition'] = context['transition']
+        return result
+
+    def refresh_playback_view(self, ticket=None):
+        # Only workers take this lock. The GUI reads the detached cached dict.
+        with self.playback_view_lock:
+            ticket = ticket or PlayTicket(self.play_queue.revision, self.play_queue.current)
+            view = self.play_queue.view(ticket)
+            if self.play_queue.matches(ticket):
+                self.playback_view = {'revision': ticket.revision, 'queue': view}
 
     def set_autoplay(self, enabled):
         if type(enabled) is not bool:
@@ -117,50 +133,116 @@ class Application:
 
     def playback_closed(self, context):
         ticket = PlayTicket(context['revision'], context['key'])
+        pending = self.play_transition
+        if pending and pending['old'] == ticket and self.play_queue.matches(pending['new']):
+            ticket = pending['new']
         if self.play_queue.cancel(ticket):
             self.emit('stopPlayerFromHost', None)
 
-    def play_ticket(self, ticket, part=1):
+    def play_ticket(self, ticket, part=1, source=None):
         with self.play_operation:
-            if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
-                raise AppClosing()
-            video = owned_videos(self.store.snapshot()).get(ticket.key)
-            if video is None:
-                self.play_queue.cancel(ticket)
-                raise ValueError('该视频或博主已不在你的关注清单。')
-            context = {'key': ticket.key, 'revision': ticket.revision}
-            managers = (self.focus_player, self.youtube_player)
-            keep_fullscreen = any(m._fullscreen and m._fullscreen.active for m in managers)
-            if youtube_video_id(video):
-                self.focus_player.close()
-                manager = self.youtube_player
-                self.request(manager.open, youtube_video_id(video), video['title'], playback=context)
-            else:
-                self.youtube_player.close()
-                manager = self.focus_player
-                self.request(manager.open, video_bvid(video), video['title'], int(part), playback=context)
-            if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
-                manager.close()
-                raise AppClosing()
-            if keep_fullscreen:
-                def restore():
-                    if manager.ready.wait(15) and self.play_queue.matches(ticket) and manager._fullscreen:
-                        manager._fullscreen.set(True)
-                threading.Thread(target=restore, daemon=True, name='continue-fullscreen').start()
-            self.store.mark_read(ticket.key)
-            self.changed()
-            return {'ok': True, 'video': video, 'bvid': video_bvid(video), 'video_id': youtube_video_id(video),
-                    'platform': video.get('platform', 'bilibili'), 'part': int(part), 'order': list(self.play_queue.order), 'revision': ticket.revision}
+            origin_pending = None
+            if source:
+                previous_context = source['context']
+                origin_pending = {'old': PlayTicket(previous_context['revision'], previous_context['key']), 'new': ticket}
+                self.play_transition = origin_pending
+            try:
+                # A close can happen after queue.move/select but before this
+                # worker obtains the operation lock. Register first, then verify
+                # the originating native window before touching the store.
+                if source and not source['manager'].context_is_current(source['context']):
+                    self.play_queue.cancel(ticket)
+                    raise AppClosing()
+                if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
+                    raise AppClosing()
+                video = owned_videos(self.store.snapshot()).get(ticket.key)
+                if video is None:
+                    self.play_queue.cancel(ticket)
+                    raise ValueError('该视频或博主已不在你的关注清单。')
+                context = {'key': ticket.key, 'revision': ticket.revision}
+                managers = (self.focus_player, self.youtube_player)
+                keep_fullscreen = any(m._fullscreen and m._fullscreen.active for m in managers)
+                manager = self.youtube_player if youtube_video_id(video) else self.focus_player
+                other = self.focus_player if manager is self.youtube_player else self.youtube_player
+                self.refresh_playback_view(ticket)
+                if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
+                    raise AppClosing()
+                previous, previous_context = None, None
+                for candidate in managers:
+                    old_context = candidate.context_snapshot()
+                    if isinstance(old_context, dict) and (old_context['key'], old_context['revision']) != (ticket.key, ticket.revision):
+                        previous, previous_context = candidate, old_context
+                        break
+                pending = None
+                try:
+                    if previous_context:
+                        info = dict(title=video['title'], author=video.get('author', '博主'),
+                                    platform=video.get('platform', 'bilibili'), part=int(part))
+                        context['transition'] = info
+                        pending = {'old': PlayTicket(previous_context['revision'], previous_context['key']), 'new': ticket}
+                        self.play_transition = pending
+                        if previous.prepare_transition(dict(info, cancellable=False)):
+                            if self.stopping.wait(.22) or not self.play_queue.matches(ticket):
+                                raise AppClosing()
+                    if previous is not other:
+                        other.close()
+                    if youtube_video_id(video):
+                        self.request(manager.open, youtube_video_id(video), video['title'], playback=context)
+                    else:
+                        self.request(manager.open, video_bvid(video), video['title'], int(part), playback=context)
+                    if previous is other:
+                        # Keep the old transition card visible until the destination
+                        # has a native browser. This wait runs only on a worker.
+                        deadline = time.monotonic() + 15
+                        while not manager.ready.wait(.05):
+                            if (self.stopping.is_set() or not self.play_queue.matches(ticket) or
+                                    manager.last_error or time.monotonic() >= deadline):
+                                break
+                        if self.stopping.is_set() or not self.play_queue.matches(ticket):
+                            raise AppClosing()
+                        if not manager.ready.is_set() or manager.last_error:
+                            self.play_queue.cancel(ticket)
+                            manager.close_if_context(context)
+                            raise RuntimeError('目标播放窗口未能准备就绪。')
+                        if keep_fullscreen and manager._fullscreen and self.play_queue.matches(ticket):
+                            manager._fullscreen.set(True)
+                finally:
+                    if pending is not None and self.play_transition is pending:
+                        self.play_transition = None
+                    if previous is other:
+                        other.close_if_context(previous_context)
+                if not self.play_queue.matches(ticket) or self.quitting or not self.playback_allowed:
+                    manager.close()
+                    raise AppClosing()
+                if keep_fullscreen:
+                    def restore():
+                        if manager.ready.wait(15) and self.play_queue.matches(ticket) and manager._fullscreen:
+                            manager._fullscreen.set(True)
+                    threading.Thread(target=restore, daemon=True, name='continue-fullscreen').start()
+                self.store.mark_read(ticket.key)
+                self.changed()
+                return {'ok': True, 'video': video, 'bvid': video_bvid(video), 'video_id': youtube_video_id(video),
+                        'platform': video.get('platform', 'bilibili'), 'part': int(part), 'order': list(self.play_queue.order), 'revision': ticket.revision}
+            finally:
+                if origin_pending is not None and self.play_transition is origin_pending:
+                    self.play_transition = None
 
     def playback_signal(self, config, kind, sample):
         ticket = PlayTicket(config['revision'], config['key'])
         if not self.playback_config(config):
             return
+        next_ticket = None
         try:
             if kind == 'autoplay':
                 self.set_autoplay(sample.get('value'))
                 return
-            if kind not in ('next', 'ended'):
+            if kind == 'cancel':
+                if self.play_queue.cancel(ticket):
+                    for manager in (self.focus_player, self.youtube_player):
+                        manager.close_if_context(config)
+                    self.emit('stopPlayerFromHost', None)
+                return
+            if kind not in ('next', 'ended', 'select'):
                 return
             part, pages = sample.get('part'), sample.get('pages')
             if kind == 'ended':
@@ -171,7 +253,13 @@ class Application:
                 self.changed()
                 if not self.autoplay_followed:
                     return
-            if kind == 'ended' and not ticket.key.startswith('yt:') and type(part) is int and type(pages) is int and 1 <= part < pages <= 999:
+            if kind == 'select':
+                next_ticket = self.play_queue.select(ticket, sample.get('value'))
+                next_part = 1
+                if next_ticket is None:
+                    self.refresh_playback_view(ticket)
+                    return
+            elif kind == 'ended' and not ticket.key.startswith('yt:') and type(part) is int and type(pages) is int and 1 <= part < pages <= 999:
                 next_ticket = self.play_queue.next_part(ticket)
                 next_part = part + 1
             else:
@@ -183,12 +271,16 @@ class Application:
                     manager = self.youtube_player if ticket.key.startswith('yt:') else self.focus_player
                     post_js(manager._window, "window.BiliFocus?.showNotice('当前关注清单已播完。')")
                 return
-            result = self.play_ticket(next_ticket, next_part)
+            source = self.youtube_player if ticket.key.startswith('yt:') else self.focus_player
+            result = self.play_ticket(next_ticket, next_part, source={'manager': source, 'context': config})
             if self.play_queue.matches(next_ticket):
                 self.emit('playbackAdvanced', dict(result, previous_key=ticket.key))
         except AppClosing:
             pass
         except Exception:
+            if next_ticket is not None and self.play_queue.cancel(next_ticket):
+                manager = self.youtube_player if next_ticket.key.startswith('yt:') else self.focus_player
+                manager.close_if_context({'key': next_ticket.key, 'revision': next_ticket.revision})
             logging.exception('Followed playback could not continue')
             self.emit('playbackError', '下一条视频未能打开，请手动重试；播放清单仍只包含你的关注。')
 
@@ -301,6 +393,7 @@ class Application:
             post_js(self.window, f'window.{method}({json.dumps(value, ensure_ascii=True)})')
 
     def changed(self):
+        self.refresh_playback_view()
         self.emit('receiveState', self.snapshot())
 
     def show(self):

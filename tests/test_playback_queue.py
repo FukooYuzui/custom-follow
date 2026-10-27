@@ -53,6 +53,81 @@ class FollowedQueueTests(unittest.TestCase):
         for key in ('https://www.youtube.com/watch?v=AAAAAAAAAAA','yt:BBBBBBBBBBB','no-video'):
             with self.assertRaises(ValueError):self.queue.start(key)
 
+    def test_view_contains_current_and_filtered_future_with_stable_metadata_version(self):
+        self.data['videos'][0].update(title='Bili one',author='Bili creator',watched=True)
+        self.data['videos'][1].update(title='Tube one',author='Tube creator')
+        ticket=self.queue.start(B1)
+        view=self.queue.view(ticket)
+        self.assertEqual([B1,Y1,B2],[item['key'] for item in view['items']])
+        self.assertEqual([True,False,False],[item['current'] for item in view['items']])
+        self.assertEqual('youtube',view['items'][1]['platform'])
+        self.assertEqual('Bili one',view['items'][0]['title'])
+        self.assertTrue(view['items'][0]['watched'])
+        self.assertEqual(2,view['remaining'])
+        self.assertEqual(view['version'],self.queue.view(ticket)['version'])
+        view['items'][0]['title']='caller mutation'
+        self.assertEqual('Bili one',self.queue.view(ticket)['items'][0]['title'])
+        self.data['videos'][1]['title']='updated title'
+        self.assertNotEqual(view['version'],self.queue.view(ticket)['version'])
+
+    def test_view_and_remaining_skip_removed_and_newly_watched_future_entries(self):
+        ticket=self.queue.start(B1,unwatched_only=True)
+        self.data['videos'][0]['watched']=True
+        self.data['videos'][1]['watched']=True
+        view=self.queue.view(ticket)
+        self.assertEqual([B1,B2],[item['key'] for item in view['items']])
+        self.assertEqual(1,self.queue.remaining(ticket))
+        self.data['videos']=[v for v in self.data['videos'] if v['key']!=B2]
+        self.assertEqual([B1],[item['key'] for item in self.queue.view(ticket)['items']])
+        self.assertEqual(0,self.queue.remaining(ticket))
+
+    def test_view_after_advance_has_no_past_entries_and_stale_view_is_empty(self):
+        old=self.queue.start(B1)
+        current=self.queue.move(old)
+        self.assertEqual([Y1,B2],[item['key'] for item in self.queue.view(current)['items']])
+        self.assertEqual([],self.queue.view(old)['items'])
+        self.assertEqual(0,self.queue.view(old)['remaining'])
+        self.queue.cancel()
+        self.assertEqual(self.queue.view(None)['version'],self.queue.view(current)['version'])
+
+    def test_select_requires_exact_queue_lease_and_an_owned_future_item(self):
+        original=self.queue.start(B1,[B1,Y1,B2])
+        for invalid in (B1,'yt:BBBBBBBBBBB','https://www.youtube.com/watch?v=AAAAAAAAAAA','BV1xx411c7UV',None,{}):
+            self.assertIsNone(self.queue.select(original,invalid))
+        self.queue.mark_finished(original)
+        chosen=self.queue.select(original,B2)
+        self.assertEqual(B2,chosen.key)
+        self.assertEqual(original.revision+1,chosen.revision)
+        self.assertTrue(self.queue.is_active())
+        self.assertIsNone(self.queue.select(original,Y1),'an old list event cannot override the new selection')
+        self.assertIsNone(self.queue.select(chosen,B1),'the upcoming drawer cannot select a past entry')
+
+    def test_select_rechecks_membership_and_scheduled_watched_state(self):
+        ticket=self.queue.start(B1,unwatched_only=True)
+        self.data['channels']=[{'uid':'42'}]
+        self.assertIsNone(self.queue.select(ticket,Y1))
+        self.data['videos'][2]['watched']=True
+        self.assertIsNone(self.queue.select(ticket,B2))
+        self.assertEqual(B1,self.queue.current)
+
+    def test_view_store_read_does_not_hold_queue_lock_or_delay_cancel(self):
+        ticket=self.queue.start(B1)
+        reading=threading.Event();release=threading.Event();cancelled=threading.Event();result=[]
+        def slow_snapshot():
+            reading.set();release.wait(3)
+            return copy.deepcopy(self.data)
+        self.queue.snapshot=slow_snapshot
+        worker=threading.Thread(target=lambda:result.append(self.queue.view(ticket)))
+        worker.start()
+        self.assertTrue(reading.wait(1))
+        cancel=threading.Thread(target=lambda:(self.queue.cancel(),cancelled.set()))
+        cancel.start()
+        try:
+            self.assertTrue(cancelled.wait(1),'cancel must not wait for a store snapshot')
+        finally:
+            release.set();worker.join(3);cancel.join(3)
+        self.assertEqual([],result[0]['items'],'a cancelled lease cannot return a stale playable list')
+
 
 class AutoplayApplicationTests(unittest.TestCase):
     def setUp(self):

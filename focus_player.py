@@ -7,6 +7,7 @@ through CookieManager, never through JavaScript, URLs, or logging.
 from __future__ import annotations
 
 import html
+import json
 import logging
 from pathlib import Path
 import re
@@ -15,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
-from native_ui import close_window, show_window, PlayerFullscreen, PlaybackWatcher
+from native_ui import close_window, show_window, post_js, PlayerFullscreen, PlaybackWatcher
 
 
 BVID = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -27,6 +28,20 @@ WAITING_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval'">
 <style>html,body{height:100%;margin:0;background:#101217;color:#dae1ee;font:16px 'Microsoft YaHei UI',sans-serif}body{display:grid;place-items:center}main{text-align:center}p{font-size:13px;color:#a8b3c9;line-height:1.8}</style>
 <main><h2>正在准备官方网页播放器</h2><p>保留正常的画质和登录选项，隐藏推荐内容。<br>请稍候…</p></main></html>"""
+
+
+def waiting_html(info=None):
+    if not info:
+        return WAITING_HTML
+    title = html.escape(str(info.get('title') or '下一条视频')[:200])
+    author = html.escape(str(info.get('author') or '博主')[:100])
+    label = 'YouTube' if info.get('platform') == 'youtube' else 'B站'
+    part = info.get('part', 1)
+    if isinstance(part, int) and not isinstance(part, bool) and part > 1:
+        label += f' · P{part}'
+    return WAITING_HTML.replace('<style>', '<style>main{max-width:660px;padding:32px;animation:cf-enter .24s ease-out}h2{line-height:1.6}small{color:#f391b3;letter-spacing:2px}.cf-loading{width:44px;height:3px;margin:26px auto;background:#f391b3;border-radius:3px;animation:cf-pulse 1s ease-in-out infinite alternate}@keyframes cf-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}@keyframes cf-pulse{to{opacity:.25;transform:scaleX(.55)}}@media(prefers-reduced-motion:reduce){main,.cf-loading{animation:none!important}}').replace(
+        '<main><h2>正在准备官方网页播放器</h2><p>保留正常的画质和登录选项，隐藏推荐内容。<br>请稍候…</p></main>',
+        f'<main><small>即将播放 · {label}</small><h2>{title}</h2><p>{author}</p><div class="cf-loading"></div><p>正在打开官方播放器…</p></main>')
 
 
 def video_url(bvid: str, part: int = 1) -> str:
@@ -175,7 +190,7 @@ class FocusPlayer:
             if window is None:
                 window = webview.create_window(
                     "官方网页专注播放 · " + display_title,
-                    html=WAITING_HTML, js_api=None,
+                    html=waiting_html(playback.get('transition') if playback else None), js_api=None,
                     width=1280, height=850, min_size=(960, 620),
                     background_color="#101217", menu=self._menu(),
                 )
@@ -217,20 +232,50 @@ class FocusPlayer:
         with self._lock:
             return self._window is window
 
+    def context_snapshot(self):
+        with self._lock:
+            return dict(self._playback_context) if self._window and self._playback_context else None
+
+    def context_is_current(self, context):
+        with self._lock:
+            return bool(self._window and self._playback_context and all(
+                self._playback_context.get(k) == context.get(k) for k in ('key', 'revision')))
+
+    def _playback_current(self, window):
+        with self._lock:
+            context = self._playback_context
+            current = self._window is window
+        return current and self.can_open() and (not context or not self.playback_config or bool(self.playback_config(context)))
+
+    def prepare_transition(self, info):
+        with self._lock:
+            window = self._window
+        return post_js(window, 'window.CustomFollowPlayback?.prepareTransition(' + json.dumps(info, ensure_ascii=True) + ');')
+
+    def close_if_context(self, context):
+        with self._lock:
+            current = self._playback_context
+            if not current or not context or any(current.get(k) != context.get(k) for k in ('key', 'revision')):
+                return False
+            self.close()
+            return True
+
     def _initialize(self, window, script):
         try:
             if not window.events.loaded.wait(25):
                 raise TimeoutError("本地播放窗口初始化超时。")
-            if not self._is_current(window):
+            if not self._playback_current(window):
                 return
             task = self._ui(window, lambda: self._install_native(window, script))
             # The browser completes this on its STA. Waiting happens on this worker.
             if not task.Wait(15000):
                 raise TimeoutError("专注模式初始化超时。")
             task.GetAwaiter().GetResult()
-            if not self._is_current(window):
+            if not self._playback_current(window):
                 return
             self._copy_authorized_login(window)
+            if not self._playback_current(window):
+                return
             with self._lock:
                 if self._window is not window:
                     return
@@ -317,6 +362,10 @@ class FocusPlayer:
                     self._navigation_pending = False
             fullscreen.sync_document(core)
             fullscreen.preserve_navigation = False
+            with self._lock:
+                context = self._playback_context if self._window is window else None
+            if context and context.get('transition'):
+                core.ExecuteScriptAsync('window.CustomFollowPlayback?.prepareTransition(' + json.dumps(context['transition'], ensure_ascii=True) + ');')
 
         def source_changed(sender, args):
             if not self._is_current(window):
@@ -357,7 +406,7 @@ class FocusPlayer:
         return allowed_youtube_navigation(url, code) if self.platform == 'youtube' else allowed_navigation(url, code)
 
     def _navigate(self, window, url, title, copy_login=True):
-        if not self._is_current(window):
+        if not self._playback_current(window):
             return
         if copy_login:
             self._copy_authorized_login(window)
