@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Any
+from playback_schedule import DEFAULT_SCHEDULE, EDITABLE_FIELDS, validate_schedule, due_slot, target_today
 
 
 DEFAULT_SETTINGS = {
@@ -120,6 +121,10 @@ class Store:
                         else channel.get("baseline_at")
                     ) if channel.get("initialized") else None)
                 for video in data['videos']:
+                    # Old "read" acknowledged notifications, including baseline
+                    # imports; it cannot establish that a video was watched.
+                    video.setdefault('watched', False)
+                    video.setdefault('watched_at', None)
                     video.setdefault('platform', 'youtube' if video.get('uid', '').startswith('yt:') else 'bilibili')
                     if video['platform'] == 'youtube':
                         video['published_precision'] = _publication_precision(video)
@@ -131,6 +136,9 @@ class Store:
                 self._validate_settings(settings)
                 data["settings"] = settings
                 data.setdefault("last_manual_check", 0)
+                schedule = dict(DEFAULT_SCHEDULE, **data.get('play_schedule', {}))
+                validate_schedule(schedule)
+                data['play_schedule'] = schedule
                 self._data = data
             except (ValueError, TypeError, AttributeError) as exc:
                 raise ValueError(f"无法读取本地数据文件，请保留文件后再修复：{self.path.name}") from exc
@@ -141,6 +149,7 @@ class Store:
                 "channels": [],
                 "videos": [],
                 "last_manual_check": 0,
+                'play_schedule': dict(DEFAULT_SCHEDULE),
             }
             self._save(self._data)
 
@@ -182,6 +191,65 @@ class Store:
     def snapshot(self) -> dict:
         with self._lock:
             return copy.deepcopy(self._data)
+
+    def save_playback_schedule(self, values, now=None):
+        if not isinstance(values, dict) or set(values) - EDITABLE_FIELDS:
+            raise ValueError('定时播放设置格式无效。')
+        current = now or datetime.now()
+        with self._lock:
+            data = copy.deepcopy(self._data)
+            config = data['play_schedule']
+            config.update(values)
+            validate_schedule(config)
+            if config['enabled'] and config['mode'] == 'once' and target_today(config, current) < current.replace(second=0, microsecond=0):
+                raise ValueError('请选择尚未到达的日期和时间。')
+            if config['channel_uid'] and not any(c['uid'] == config['channel_uid'] and
+                    (not config['platform'] or c.get('platform', 'bilibili') == config['platform']) for c in data['channels']):
+                raise ValueError('所选博主已移除或不属于所选平台，请重新选择。')
+            config['generation'] += 1
+            self._commit(data)
+            return copy.deepcopy(config)
+
+    def claim_playback_schedule(self, now=None):
+        current = now or datetime.now()
+        with self._lock:
+            slot = due_slot(self._data['play_schedule'], current)
+            if slot is None:
+                return None
+            data = copy.deepcopy(self._data)
+            config = data['play_schedule']
+            config.update(last_slot=slot, last_result='正在准备播放。', last_run_at=current.timestamp())
+            if config['mode'] == 'once':
+                config['enabled'] = False
+            self._commit(data)
+            return copy.deepcopy(config)
+
+    def finish_playback_schedule(self, lease, message):
+        with self._lock:
+            current = self._data['play_schedule']
+            if any(current[k] != lease[k] for k in ('generation', 'last_slot')):
+                return False
+            data = copy.deepcopy(self._data)
+            data['play_schedule']['last_result'] = str(message)[:300]
+            self._commit(data)
+            return True
+
+    def set_watched(self, key, watched=True, now=None):
+        if type(watched) is not bool:
+            raise ValueError('观看状态必须为已看或未看。')
+        with self._lock:
+            item = next((v for v in self._data['videos'] if v['key'] == key), None)
+            if item is None:
+                raise ValueError('该视频已不在你的关注清单。')
+            if item.get('watched', False) == watched:
+                return False
+            data = copy.deepcopy(self._data)
+            video = next(v for v in data['videos'] if v['key'] == key)
+            video.update(watched=watched, watched_at=_timestamp(now) if watched else None)
+            if watched:
+                video['read'] = True
+            self._commit(data)
+            return True
 
     def add_channel(self, uid: str, name: str = "", platform: str = 'bilibili') -> dict:
         if platform == 'youtube':
@@ -311,9 +379,11 @@ class Store:
                     'timestamp_approximate': bool(_field(source, 'timestamp_approximate', False)),
                     'published_precision': _publication_precision(source),
                     "read": not is_new, "detected_at": checked_at,
+                    'watched': False, 'watched_at': None,
                 }
                 if previous is not None:
                     video.update({field: previous[field] for field in ("is_new", "read", "detected_at")})
+                    video.update(watched=previous.get('watched', False), watched_at=previous.get('watched_at'))
                     rank = {'unknown': 0, 'relative': 1, 'day': 2, 'second': 3}
                     if rank[_publication_precision(previous)] > rank[video['published_precision']]:
                         for field in ('published_at', 'published_label', 'timestamp_approximate'):

@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 
 import qrcode
 import webview
@@ -28,6 +29,7 @@ from focus_player import FocusPlayer
 from youtube_api import YouTubeClient, YouTubeError, youtube_video_id
 from native_ui import post_window, post_js, close_window, show_window, install_bridge_delivery
 from playback_queue import FollowedQueue, PlayTicket, owned_videos
+from playback_schedule import unwatched_order, next_due
 
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'assets'
@@ -88,6 +90,9 @@ class Application:
         self.play_queue = FollowedQueue(self.store.snapshot)
         self.play_operation = threading.Lock()
         self.autoplay_followed = self.store.snapshot()['settings']['autoplay_followed']
+        self.embedded_active = False
+        self.schedule_wake = threading.Event()
+        self.schedule_starting = None
         can_open = lambda: self.playback_allowed and not self.quitting
         playback = dict(playback_config=self.playback_config, on_playback=self.playback_signal, on_closed=self.playback_closed)
         self.focus_player = FocusPlayer(ASSETS, self.playback_cookies, self.return_from_player, can_open=can_open, **playback)
@@ -155,11 +160,17 @@ class Application:
             if kind == 'autoplay':
                 self.set_autoplay(sample.get('value'))
                 return
-            if kind == 'ended' and not self.autoplay_followed:
-                return
             if kind not in ('next', 'ended'):
                 return
             part, pages = sample.get('part'), sample.get('pages')
+            if kind == 'ended':
+                final_part = ticket.key.startswith('yt:') or (type(part) is int and type(pages) is int and 1 <= pages <= part <= 999)
+                if final_part:
+                    self.store.set_watched(ticket.key)
+                self.play_queue.mark_finished(ticket)
+                self.changed()
+                if not self.autoplay_followed:
+                    return
             if kind == 'ended' and not ticket.key.startswith('yt:') and type(part) is int and type(pages) is int and 1 <= part < pages <= 999:
                 next_ticket = self.play_queue.next_part(ticket)
                 next_part = part + 1
@@ -167,6 +178,7 @@ class Application:
                 next_ticket = self.play_queue.move(ticket)
                 next_part = 1
             if next_ticket is None:
+                self.play_queue.mark_finished(ticket)
                 if self.play_queue.matches(ticket):
                     manager = self.youtube_player if ticket.key.startswith('yt:') else self.focus_player
                     post_js(manager._window, "window.BiliFocus?.showNotice('当前关注清单已播完。')")
@@ -179,6 +191,65 @@ class Application:
         except Exception:
             logging.exception('Followed playback could not continue')
             self.emit('playbackError', '下一条视频未能打开，请手动重试；播放清单仍只包含你的关注。')
+
+    def schedule_tick(self, now=None):
+        if self.quitting or not self.ready.is_set():
+            return None
+        lease = self.store.claim_playback_schedule(now)
+        if lease is None:
+            return None
+        ticket = None
+        try:
+            revision = self.play_queue.revision
+            if self.play_queue.is_active() or self.embedded_active:
+                message = '正在播放，本次定时任务已跳过。'
+            else:
+                order = unwatched_order(self.store.snapshot(), lease)
+                if not order:
+                    message = '没有符合条件的未看视频，本次未播放。'
+                elif self.store.snapshot()['play_schedule']['generation'] != lease['generation']:
+                    return None
+                else:
+                    with self.lifecycle_lock:
+                        if self.quitting:
+                            return None
+                        self.playback_allowed = True
+                    ticket = self.play_queue.start(order[0], order, unwatched_only=True, if_idle=True, revision=revision)
+                    self.schedule_starting = ticket
+                    if self.store.snapshot()['play_schedule']['generation'] != lease['generation']:
+                        self.play_queue.cancel(ticket)
+                        return None
+                    result = self.play_ticket(ticket)
+                    message = f'已开始播放未看清单，共 {len(order)} 条。'
+                    if self.play_queue.matches(ticket):
+                        self.emit('playbackStarted', result)
+            self.store.finish_playback_schedule(lease, message)
+            self.changed()
+            return message
+        except AppClosing:
+            if not self.quitting:
+                self.store.finish_playback_schedule(lease, '播放已取消。')
+            return None
+        except Exception as exc:
+            if ticket:
+                self.play_queue.cancel(ticket)
+            logging.exception('Scheduled playback could not start')
+            message = str(exc) if isinstance(exc, ValueError) else '定时播放未能启动，请检查网络后手动重试。'
+            self.store.finish_playback_schedule(lease, message)
+            self.changed()
+            return message
+        finally:
+            if ticket is not None and self.schedule_starting == ticket:
+                self.schedule_starting = None
+
+    def schedule_worker(self):
+        while not self.stopping.is_set():
+            try:
+                self.schedule_tick()
+            except Exception:
+                logging.exception('Playback appointment check failed')
+            self.schedule_wake.wait(1)
+            self.schedule_wake.clear()
 
     def request(self, function, *args, **kwargs):
         """Let an RPC caller stop waiting when the application is closing.
@@ -220,6 +291,9 @@ class Application:
         data['runtime'] = {'account': self.account, 'account_valid': self.account_valid,
                            'warning': self.warning, 'checking': self.checking,
                            'tray': self.tray_ok, 'autostart': get_autostart(), 'playback_revision': self.play_queue.revision}
+        config = data['play_schedule']
+        data['runtime']['schedule_next'] = next_due(config)
+        data['runtime']['schedule_unwatched'] = len(unwatched_order(data, config))
         return data
 
     def emit(self, method, value):
@@ -241,6 +315,7 @@ class Application:
             if self.quitting or not self.tray_ok:
                 return False
             self.playback_allowed = False
+            self.embedded_active = False
         self.play_queue.cancel()
         # This callback may run on the GUI thread: enqueue work and return.
         # Do not evaluate_js, Invoke, join, or wait for a renderer here.
@@ -270,8 +345,10 @@ class Application:
                 return
             self.quitting = True
             self.playback_allowed = False
+            self.embedded_active = False
             self.stopping.set()
             self.wake.set()
+            self.schedule_wake.set()
         self.play_queue.cancel()
         self.focus_player.close()
         self.youtube_player.close()
@@ -421,6 +498,7 @@ class Application:
         self.changed()
         threading.Thread(target=self.worker, name='bili-monitor', daemon=True).start()
         threading.Thread(target=self.notification_worker, name='bili-notifications', daemon=True).start()
+        threading.Thread(target=self.schedule_worker, name='playback-schedule', daemon=True).start()
 
 
 class Api:
@@ -430,6 +508,31 @@ class Api:
 
     def snapshot(self):
         return self._app.snapshot()
+
+    def save_playback_schedule(self, values):
+        try:
+            config = self._app.store.save_playback_schedule(values)
+            if self._app.schedule_starting is not None:
+                self._app.play_queue.cancel(self._app.schedule_starting)
+            self._app.schedule_wake.set()
+            self._app.changed()
+            return {'ok': True, 'schedule': config, 'next': next_due(config)}
+        except (ValueError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)}
+
+    def set_watched(self, key, watched):
+        try:
+            self._app.store.set_watched(key, watched)
+            self._app.changed()
+            return {'ok': True}
+        except (ValueError, OSError) as exc:
+            return {'ok': False, 'error': str(exc)}
+
+    def set_embedded_active(self, enabled):
+        if type(enabled) is not bool:
+            return {'ok': False, 'error': '播放状态无效。'}
+        self._app.embedded_active = enabled
+        return {'ok': True}
 
     def add_channel(self, text, platform='bilibili'):
         try:
@@ -529,12 +632,17 @@ class Api:
             return {'ok': False, 'error': '该视频已不在你的关注列表，或视频编号无效。'}
         if isinstance(part, bool) or not isinstance(part, (int, float)) or not math.isfinite(part) or int(part) != part or not 1 <= part <= 999:
             return {'ok': False, 'error': '分 P 序号应为 1 至 999 的整数。'}
+        ticket = None
         try:
             ticket = self._app.play_queue.start(key, order)
             return self._app.play_ticket(ticket, int(part))
         except AppClosing as exc:
+            if ticket:
+                self._app.play_queue.cancel(ticket)
             return {'ok': False, 'error': str(exc)}
         except Exception:
+            if ticket:
+                self._app.play_queue.cancel(ticket)
             logging.exception('Official player could not open')
             return {'ok': False, 'error': '官方播放窗口未能打开，请稍后重试，或切换到嵌入备用模式。'}
 

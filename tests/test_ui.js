@@ -36,8 +36,35 @@ ctx.pywebview={api:{
   open_focus_video:async(...args)=>{calls.push(['focus',...args]);return {ok:true};},
   close_focus_video:async()=>{calls.push(['close']);return {ok:true};},
   add_channel:async(...args)=>{calls.push(['add',...args]);return {ok:true};}
+  ,set_watched:async(...args)=>{calls.push(['watched',...args]);return {ok:true};}
+  ,set_embedded_active:async(...args)=>{calls.push(['embedded',...args]);return {ok:true};}
+  ,save_playback_schedule:async values=>{calls.push(['schedule',values]);return {ok:true,schedule:values,next:'2026-10-28T20:00'};}
 }};
 async function run(){
+  const doc=window.document;
+  const beforeMark=calls.length;
+  doc.querySelector('.watch-action button').click();
+  await Promise.resolve();
+  assert.equal(calls.length,beforeMark+1,'watch marking does not start playback');
+  assert.equal(calls.at(-1)[0],'watched');
+  ctx.setPage('schedule');
+  assert.equal(doc.getElementById('schedulePage').hidden,false);
+  doc.getElementById('scheduleEnabled').checked=true;
+  doc.getElementById('scheduleMode').value='once';
+  doc.getElementById('scheduleDate').value='2026-10-28';
+  ctx.updateScheduleInputs();
+  assert.equal(doc.getElementById('scheduleDateRow').hidden,false);
+  doc.getElementById('schedulePlatform').value='youtube';ctx.updateScheduleChannels();
+  assert.equal(doc.querySelectorAll('#scheduleChannel option').length,2,'only saved creators on the selected platform appear');
+  await ctx.saveSchedule();
+  assert.equal(calls.find(c=>c[0]==='schedule')[1].mode,'once');
+  assert.match(doc.getElementById('scheduleSummary').textContent,/2026-10-28/);
+  vm.runInContext('scheduleDirty=true',ctx);
+  doc.getElementById('scheduleTime').value='21:30';
+  ctx.receiveState(snapshot);
+  assert.equal(doc.getElementById('scheduleTime').value,'21:30','background refresh preserves unsaved edits');
+  vm.runInContext('scheduleDirty=false',ctx);
+  ctx.setPage('feed');
   await ctx.openVideo(yt.key);
   assert(calls.some(c=>c[0]==='focus'&&c[1]===yt.key));
   assert.deepEqual(Array.from(calls.find(c=>c[0]==='focus')[3]),[yt.key],'only the currently filtered list is sent to the host queue');

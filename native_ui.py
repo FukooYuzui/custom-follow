@@ -64,6 +64,7 @@ class PlaybackWatcher:
         self.config, self.on_signal = config, on_signal
         self.pending = False
         self.token, self.action_seq, self.ended_sent = '', 0, False
+        self.completion_sent = False
         self.timer = None
         self.handlers = []
 
@@ -87,6 +88,7 @@ class PlaybackWatcher:
                 return
             if self.token != config['token']:
                 self.token, self.action_seq, self.ended_sent = config['token'], 0, False
+                self.completion_sent = False
             script = 'window.CustomFollowPlayback?window.CustomFollowPlayback.observe(' + json.dumps(config, ensure_ascii=True) + '):null'
             self.pending = True
             def complete(task):
@@ -107,8 +109,9 @@ class PlaybackWatcher:
                         if action.get('name') in ('autoplay', 'next'):
                             signal(config, action['name'], action)
                         return
-                    if sample.get('ended') is True and current['autoplay'] and not self.ended_sent:
-                        self.ended_sent = True
+                    if sample.get('ended') is True and (not self.completion_sent or current['autoplay'] and not self.ended_sent):
+                        self.completion_sent = True
+                        self.ended_sent = bool(current['autoplay'])
                         signal(config, 'ended', sample)
                 except Exception as exc:
                     logging.debug('Playback sample unavailable (%s)', type(exc).__name__)

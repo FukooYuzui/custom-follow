@@ -23,9 +23,13 @@ class FollowedQueue:
         self.revision = 0
         self.current = None
         self.order = []
+        self.finished = False
+        self.unwatched_only = False
 
-    def start(self, key, order=None):
+    def start(self, key, order=None, unwatched_only=False, if_idle=False, revision=None):
         videos = owned_videos(self.snapshot())
+        if unwatched_only:
+            videos = {k: v for k, v in videos.items() if not v.get('watched', False)}
         if key not in videos:
             raise ValueError('该视频或博主已不在你的关注清单。')
         if order is not None and (not isinstance(order, list) or len(order) > 500 or any(not isinstance(k, str) for k in order)):
@@ -34,9 +38,21 @@ class FollowedQueue:
         if key not in keys:
             keys.insert(0, key)
         with self._lock:
+            if if_idle and (self.is_active() or revision is not None and revision != self.revision):
+                raise ValueError('正在播放，本次定时任务已跳过。')
             self.revision += 1
             self.current, self.order = key, keys
+            self.finished, self.unwatched_only = False, unwatched_only
             return PlayTicket(self.revision, key)
+
+    def is_active(self):
+        with self._lock:
+            return self.current is not None and not self.finished
+
+    def mark_finished(self, ticket):
+        with self._lock:
+            if self.matches(ticket):
+                self.finished = True
 
     def matches(self, ticket):
         with self._lock:
@@ -50,9 +66,10 @@ class FollowedQueue:
             index = self.order.index(ticket.key) + delta
             while 0 <= index < len(self.order):
                 key = self.order[index]
-                if key in videos:
+                if key in videos and (not self.unwatched_only or not videos[key].get('watched', False)):
                     self.revision += 1
                     self.current = key
+                    self.finished = False
                     return PlayTicket(self.revision, key)
                 index += delta
             return None
@@ -62,6 +79,7 @@ class FollowedQueue:
             if not self.matches(ticket):
                 return None
             self.revision += 1
+            self.finished = False
             return PlayTicket(self.revision, ticket.key)
 
     def remaining(self, ticket):
@@ -76,4 +94,5 @@ class FollowedQueue:
                 return False
             self.revision += 1
             self.current, self.order = None, []
+            self.finished, self.unwatched_only = False, False
             return True
